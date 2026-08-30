@@ -5,6 +5,7 @@
 # Ad-hoc debug / run captures (don't commit scratch output)
 diag*.txt
 run.txt
+/tasks/
 
 # LocalBench generated data
 .localbench/

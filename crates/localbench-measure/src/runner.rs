@@ -612,7 +612,7 @@ mod tests {
         assert!(path_outside_localpilot(
             "C:/Users/x/.localbench/corpus/task"
         ));
-        assert!(!path_outside_localpilot(r"D:\repos\LocalX\LocalPilot\x"));
+        assert!(!path_outside_localpilot(r"D:\work\LocalPilot\x"));
         assert!(assert_external_corpus_path("/home/x/.localbench/c").is_ok());
         assert!(assert_external_corpus_path("/repos/LocalPilot/data").is_err());
     }
