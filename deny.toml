@@ -1,0 +1,33 @@
+[advisories]
+ignore = [
+    # Transitive through reqwest/rustls. This is an unmaintained warning, not
+    # a known vulnerability.
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "PolyForm-Noncommercial-1.0.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/C0deGeek-dev/localx-llama",
+    "https://github.com/C0deGeek-dev/LocalBox",
+]
