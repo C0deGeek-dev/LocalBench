@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localbench.local/schemas/localbox-autobest-v1.schema.json",
+  "title": "LocalBox AutoBest Compatibility Profile",
+  "type": "object",
+  "required": ["schema", "key", "entries"],
+  "properties": {
+    "schema": { "type": "integer", "const": 1 },
+    "key": { "type": "string" },
+    "source": { "type": "string" },
+    "schema_version": { "type": "string", "const": "localbox-autobest-v1" },
+    "localbench_version": { "type": "string" },
+    "launcher_export_version": { "type": "integer", "minimum": 1 },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["quant", "contextKey", "mode", "vramGB", "score", "scoreUnit", "overrides"],
+        "properties": {
+          "source": { "type": "string" },
+          "schema_version": { "type": "string", "const": "localbox-autobest-v1" },
+          "localbench_version": { "type": "string" },
+          "localbench_profile_path": { "type": ["string", "null"] },
+          "report_path": { "type": ["string", "null"] },
+          "quant": { "type": "string" },
+          "contextKey": { "type": "string" },
+          "contextTokens": { "type": "integer" },
+          "mode": { "type": "string", "enum": ["native", "turboquant", "mtpturbo", "prismml"] },
+          "vramGB": { "type": "integer" },
+          "prompt_length": { "type": "string", "enum": ["short", "long"] },
+          "vision": { "type": "boolean", "description": "Tuned with the vision encoder (mmproj) loaded in every trial." },
+          "score": { "type": "number" },
+          "scoreUnit": { "type": "string" },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "overrides": { "type": "object" },
+          "measured_at": { "type": "string" },
+          "tuner_version": { "type": "integer" },
+          "trial_count": { "type": "integer" },
+          "gpu_names": { "type": "array", "items": { "type": "string" } },
+          "llamacpp_build": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

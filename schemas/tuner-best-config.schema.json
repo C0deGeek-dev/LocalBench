@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localbench.local/schemas/tuner-best-config.schema.json",
+  "title": "LocalBench tuner best-config store (best-<key>.json)",
+  "description": "Per-model tuned best-config store written by the tuner and read back by the launcher for AutoBest launches. The file lives in the shared tuner root (~/.local-llm/tuner/best-<key>.json); both writer and reader gate on tuner_version.",
+  "type": "object",
+  "required": ["schema", "key", "entries"],
+  "properties": {
+    "schema": { "type": "integer", "const": 1 },
+    "key": { "type": "string", "minLength": 1 },
+    "vramGB": { "type": "integer" },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "quant", "contextKey", "mode", "vramGB", "prompt_length",
+          "profile", "score", "scoreUnit", "args", "overrides",
+          "measured_at", "tuner_version"
+        ],
+        "properties": {
+          "quant": { "type": "string" },
+          "contextKey": { "type": "string" },
+          "contextTokens": { "type": "integer" },
+          "mode": { "enum": ["native", "turboquant", "mtpturbo", "prismml"] },
+          "vramGB": { "type": "integer" },
+          "prompt_length": { "enum": ["short", "long"] },
+          "profile": { "enum": ["pure", "balanced"] },
+          "searchStrategy": { "enum": ["greedy", "beam"] },
+          "beamWidth": { "type": "integer", "minimum": 1 },
+          "score": { "type": "number" },
+          "scoreUnit": { "type": "string" },
+          "pureScore": { "type": "number" },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "overrides": { "type": "object" },
+          "telemetry": { "type": "object" },
+          "scoreBreakdown": { "type": "object" },
+          "measured_at": { "type": "string" },
+          "tuner_version": { "type": "integer" },
+          "trial_count": { "type": "integer" },
+          "gpu_names": { "type": "array", "items": { "type": "string" } },
+          "llamacpp_build": { "type": "string" }
+        }
+      }
+    }
+  }
+}

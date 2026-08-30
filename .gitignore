@@ -1,0 +1,33 @@
+# Local output
+*.log
+*.tmp
+
+# Ad-hoc debug / run captures (don't commit scratch output)
+diag*.txt
+run.txt
+
+# LocalBench generated data
+.localbench/
+reports/generated/
+runs/
+profiles/
+
+# Editors
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+/.localpilot.toml
+
+# LocalMind / LocalPilot runtime stores (derived; never commit — ADR-0011)
+.localmind/
+.localpilot/
+.localmind.toml
+
+# Rust build output
+/target/
+
+# Retired/generated .NET TUI build output
+/tui/

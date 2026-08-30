@@ -1,0 +1,44 @@
+{
+  "key": "q3635ba3b",
+  "schema": 1,
+  "source": "localbench",
+  "schema_version": "localbox-autobest-v1",
+  "localbench_version": "0.1.0",
+  "launcher_export_version": 1,
+  "entries": [
+    {
+      "source": "localbench",
+      "schema_version": "localbox-autobest-v1",
+      "localbench_version": "0.1.0",
+      "launcher_export_version": 1,
+      "localbench_profile_path": "~/.local-llm/localbench/profiles/q3635ba3b-native-fast-short.json",
+      "report_path": "~/.local-llm/localbench/reports/q3635ba3b-native-fast-short.md",
+      "quant": "iq2m",
+      "contextKey": "fast",
+      "mode": "native",
+      "vramGB": 24,
+      "prompt_length": "short",
+      "score": 42.5,
+      "scoreUnit": "tg_tps_median",
+      "args": [],
+      "overrides": {
+        "NGpuLayers": 999,
+        "NCpuMoe": 35,
+        "Mlock": true,
+        "NoMmap": true,
+        "UbatchSize": 512,
+        "BatchSize": 1024,
+        "FlashAttn": true,
+        "KvK": "q8_0",
+        "KvV": "q8_0"
+      },
+      "measured_at": "2026-05-06T00:00:00.0000000+02:00",
+      "tuner_version": 5,
+      "trial_count": 3,
+      "gpu_names": [
+        "NVIDIA GeForce RTX 4090"
+      ],
+      "llamacpp_build": "fixture"
+    }
+  ]
+}

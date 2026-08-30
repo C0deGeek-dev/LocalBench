@@ -1,0 +1,25 @@
+[package]
+name = "localbench-measure"
+version = "5.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "LocalBench measurement support: OOM-signature and output-quality classification, context-soak validation and stress-recovery ladders, the synthetic stress prompt, and the fingerprinted crash-safe trial cache."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+localx-eval-core = { workspace = true }
+localbench-scoring = { path = "../localbench-scoring" }
+localbench-search = { path = "../localbench-search" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true }

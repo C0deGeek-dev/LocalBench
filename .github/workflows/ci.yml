@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust:
+    # Native workspace gate, tri-platform (Windows/Linux/macOS are equal
+    # tier-1). The shared localx-llama crates are a public rev-pinned git
+    # dependency, so no fetch secret is needed.
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo check --workspace
+      # Prove the CLI binary starts on every OS — on Windows this catches the
+      # main-thread stack-overflow class that only manifests there.
+      - run: cargo run -p localbench -- version
+
+  launcher-contract-rust:
+    # Cross-repo guard: the real LocalBox version envelope must pass this
+    # product's consumer gate (version floor + version triple + declared
+    # target/runtime pairing), so an incompatible envelope change fails here.
+    name: launcher contract (rust)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: C0deGeek-dev/LocalBox
+          path: .localbox-contract
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p localbench --test launcher_contract_localbox -- --nocapture
+        env:
+          LOCALBOX_ROOT: ${{ github.workspace }}/.localbox-contract
+
+
+  doc-drift:
+    name: doc drift guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: No retired PowerShell/.NET stack described as current
+        shell: bash
+        run: |
+          # The v2.0.0 native-Rust rewrite retired the PowerShell module, the
+          # .NET TUI, its Pester suites, and the Show-* report cmdlets — every
+          # emitter is now Rust. First-party docs, sample reports, and schema
+          # notes may reference them only as tagged history, never as current.
+          # `reports/` is scanned too: that is where capability-sample.md drifted
+          # (it named the retired `Show-LocalBenchCapabilityReport` cmdlet as the
+          # renderer). The `.tests.ps1` and `Show-*` markers catch the deleted
+          # conformance suites and the retired report cmdlets specifically.
+          exclude='retired|removed|history|migrat|1\.x|legacy|no longer'
+          hits=$(grep -rniE '(Install-Module|\bPester\b|PSScriptAnalyzer|\.psm1|\.psd1|\.tests\.ps1|Show-LocalBench[A-Za-z]*)' \
+                   docs reports README.md --include='*.md' 2>/dev/null \
+                 | grep -viE "$exclude" || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a doc/report describes the retired PowerShell/.NET stack as current:"
+            echo "$hits"
+            exit 1
+          fi
+          # `examples/` holds legitimately-retained operator *.ps1 glue, so it is
+          # scanned only for the retired MODULE and report CMDLETS (not bare
+          # *.ps1 or Pester-pinning notes about those kept scripts) — a
+          # resurrected retired report cmdlet or module there is still caught.
+          ex_hits=$(grep -rniE '(Install-Module|\.psm1|\.psd1|Show-LocalBench[A-Za-z]*)' \
+                     examples --include='*.md' 2>/dev/null \
+                   | grep -viE "$exclude" || true)
+          if [ -n "$ex_hits" ]; then
+            echo "::error::an example describes a retired LocalBench module/cmdlet as current:"
+            echo "$ex_hits"
+            exit 1
+          fi
+          # Post-rewrite drift also accumulates where a *.md glob never looks:
+          # the workspace manifest comment claimed the PowerShell module still
+          # shipped, and the schema JSON descriptions named retired
+          # `New-LocalBench*` cmdlets as the emitters, both invisible to the
+          # doc scan above. Scan manifests and the schema/contract JSON for the
+          # retired module/cmdlet markers too.
+          seed_hits=$(grep -rniE '(New-LocalBench[A-Za-z]+|Show-LocalBench[A-Za-z]+|\.psm1|\.psd1|PowerShell module)' \
+                       Cargo.toml crates/*/Cargo.toml schemas examples/localbench 2>/dev/null \
+                     | grep -viE "$exclude" || true)
+          if [ -n "$seed_hits" ]; then
+            echo "::error::a manifest/schema/sample describes the retired stack as current:"
+            echo "$seed_hits"
+            exit 1
+          fi
+          echo "no retired-stack language in docs, reports, examples, manifests, or schemas."

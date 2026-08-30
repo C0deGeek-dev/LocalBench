@@ -1,0 +1,19 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localbench.local/schemas/hardware-profile.schema.json",
+  "title": "LocalBench HardwareProfile",
+  "type": "object",
+  "required": ["schema_version", "created_at", "fingerprint", "os", "cpu", "memory"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "localbench_version": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "fingerprint": { "type": "string" },
+    "os": { "type": "object" },
+    "cpu": { "type": "object" },
+    "memory": { "type": "object" },
+    "gpu": { "type": "array", "items": { "type": "object" } },
+    "nvidia": { "type": "array", "items": { "type": "object" } }
+  }
+}
+

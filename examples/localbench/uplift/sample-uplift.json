@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "task_set": "headroom-mini",
+  "model": "example-local-model",
+  "trials": 3,
+  "arms": [
+    {
+      "arm": "baseline",
+      "is_lesson_arm": false,
+      "trials": 3,
+      "task_count": 2,
+      "per_trial_success_rate": [
+        0.5,
+        0.0,
+        1.0
+      ],
+      "mean": 0.5,
+      "stddev": 0.5,
+      "injection": {
+        "arm": "baseline",
+        "is_lesson_arm": false,
+        "intended": [],
+        "injected": []
+      }
+    },
+    {
+      "arm": "lessons",
+      "is_lesson_arm": true,
+      "trials": 3,
+      "task_count": 2,
+      "per_trial_success_rate": [
+        1.0,
+        0.5,
+        1.0
+      ],
+      "mean": 0.8333,
+      "stddev": 0.2887,
+      "injection": {
+        "arm": "lessons",
+        "is_lesson_arm": true,
+        "intended": [
+          "mem-guard-rails"
+        ],
+        "injected": [
+          "mem-guard-rails"
+        ]
+      }
+    }
+  ],
+  "uplift": {
+    "baseline_arm": "baseline",
+    "lesson_arm": "lessons",
+    "baseline_mean": 0.5,
+    "lesson_mean": 0.8333,
+    "delta": 0.3333,
+    "pooled_std_dev": 0.4083,
+    "band": 0.4083,
+    "effect_size": 0.816,
+    "verdict": "no-effect"
+  }
+}

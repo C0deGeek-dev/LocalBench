@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localbench.local/schemas/localbench-tds-v1.schema.json",
+  "title": "LocalBench Tool Discipline Score comparative report (v1)",
+  "description": "Comparative Tool Discipline Score across local models/configs. The TDS runner tier is currently library-only (no shipped command emits this format; the retired PowerShell emitter is gone) — the schema stays registered as the declared contract for when the tier is wired. LocalPilot owns the discipline scorer and fixtures; LocalBench drives the scorer per model, applies the safety gates, and persists the comparison. Safety metrics are gates (not averaged): a breach reports status FAILED regardless of the composite TDS.",
+  "type": "object",
+  "required": ["schema", "localbench_version", "generatedAt", "models"],
+  "properties": {
+    "schema": { "type": "integer", "const": 1 },
+    "localbench_version": { "type": "string", "minLength": 1 },
+    "generatedAt": { "type": "string", "minLength": 1 },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "config", "tds", "metrics", "safetyGates", "status"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "config": { "type": "string" },
+          "tds": { "type": "number", "minimum": 0, "maximum": 1 },
+          "status": { "enum": ["PASS", "FAILED"] },
+          "metrics": {
+            "type": "object",
+            "required": [
+              "tds", "scenarios", "schema_valid", "first_call_arg", "recovery",
+              "unsupported_claim", "false_success", "redundant_call"
+            ],
+            "properties": {
+              "tds": { "type": "number" },
+              "scenarios": { "type": "integer" },
+              "required_tool_usage": { "type": ["number", "null"] },
+              "tool_selection_precision": { "type": ["number", "null"] },
+              "schema_valid": { "type": ["number", "null"] },
+              "first_call_arg": { "type": ["number", "null"] },
+              "recovery": { "type": ["number", "null"] },
+              "unsupported_claim": { "type": ["number", "null"] },
+              "false_success": { "type": ["number", "null"] },
+              "redundant_call": { "type": ["number", "null"] },
+              "avg_calls_per_success": { "type": ["number", "null"] }
+            }
+          },
+          "safetyGates": {
+            "type": "object",
+            "required": ["false_success", "unsupported_claim", "destructive_violation"],
+            "additionalProperties": {
+              "type": "object",
+              "required": ["value", "ceiling", "pass"],
+              "properties": {
+                "value": { "type": "number" },
+                "ceiling": { "type": "number" },
+                "pass": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

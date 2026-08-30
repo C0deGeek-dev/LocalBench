@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "corpus": "external",
+  "contamination_suspect": true,
+  "arms": [
+    {
+      "arm": "baseline",
+      "model": "example-local-model",
+      "tasks": 25,
+      "solved": 14,
+      "solve_rate": 0.56,
+      "avg_tool_calls": 18.2,
+      "avg_redundant": 1.4,
+      "avg_diff_added": 42.0,
+      "avg_interventions": 0.0,
+      "judge_overall": 0.61,
+      "isolation": "clean"
+    },
+    {
+      "arm": "coached",
+      "model": "example-local-model",
+      "tasks": 25,
+      "solved": 17,
+      "solve_rate": 0.68,
+      "avg_tool_calls": 16.9,
+      "avg_redundant": 1.1,
+      "avg_diff_added": 39.5,
+      "avg_interventions": 1.8,
+      "judge_overall": 0.66,
+      "isolation": "clean"
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "name": "headroom-project-conventions-v1",
+  "note": "Original headroom tasks for the lesson-uplift A/B. Each task asks for a project-specific convention the base model CANNOT know unguided (an invented fact), so the off-arm fails and only an injected lesson supplies the answer — a clean headroom signal, unlike near-ceiling harness-enforced discipline. Tasks + lessons are authored for LocalBench; never copied from an external benchmark (clean-room). `lesson_ids` ties each task to the lesson(s) that supply its answer, for the injection assertion.",
+  "tasks": [
+    {
+      "id": "migrations",
+      "prompt": "In the Larkspur service, what command applies pending database migrations?",
+      "expect": { "mode": "substring", "value": "lark db sync" },
+      "lesson_ids": ["lesson-migrations"]
+    },
+    {
+      "id": "feature-flags",
+      "prompt": "In the Larkspur service, where are feature flags defined?",
+      "expect": { "mode": "substring", "value": "config/flags.toml" },
+      "lesson_ids": ["lesson-feature-flags"]
+    },
+    {
+      "id": "release-tag",
+      "prompt": "What prefix does the Larkspur release tooling require on a release tag?",
+      "expect": { "mode": "substring", "value": "lk-" },
+      "lesson_ids": ["lesson-release-tag"]
+    },
+    {
+      "id": "test-runner",
+      "prompt": "What is the canonical command to run the Larkspur test suite?",
+      "expect": { "mode": "substring", "value": "lark verify" },
+      "lesson_ids": ["lesson-test-runner"]
+    },
+    {
+      "id": "log-format",
+      "prompt": "What structured-logging field does Larkspur use to correlate requests?",
+      "expect": { "mode": "substring", "value": "trace_ref" },
+      "lesson_ids": ["lesson-log-format"]
+    },
+    {
+      "id": "secrets",
+      "prompt": "Where does the Larkspur service read its API credentials from at runtime?",
+      "expect": { "mode": "all-substrings", "value": ["vault", "/larkspur/runtime"] },
+      "lesson_ids": ["lesson-secrets"]
+    }
+  ],
+  "lessons": [
+    {
+      "id": "lesson-migrations",
+      "body": "In the Larkspur service, apply pending database migrations with `lark db sync`. The older `lark migrate` command is deprecated and must not be used.",
+      "category": "ProjectConvention",
+      "confidence": 0.95,
+      "tags": ["larkspur", "database", "migrations"]
+    },
+    {
+      "id": "lesson-feature-flags",
+      "body": "Larkspur feature flags are defined in `config/flags.toml`. Do not gate behaviour on environment variables; the flags file is the single source of truth.",
+      "category": "ProjectConvention",
+      "confidence": 0.95,
+      "tags": ["larkspur", "config", "feature-flags"]
+    },
+    {
+      "id": "lesson-release-tag",
+      "body": "Larkspur release tags must start with the `lk-` prefix (for example `lk-2026.06.1`). The release tooling rejects any tag without it.",
+      "category": "DeploymentRule",
+      "confidence": 0.95,
+      "tags": ["larkspur", "release", "tagging"]
+    },
+    {
+      "id": "lesson-test-runner",
+      "body": "Run the Larkspur test suite with `lark verify`. This wraps unit, integration, and contract tests; calling the underlying test framework directly skips the contract checks.",
+      "category": "TestingStrategy",
+      "confidence": 0.95,
+      "tags": ["larkspur", "testing"]
+    },
+    {
+      "id": "lesson-log-format",
+      "body": "Larkspur correlates requests across services using the structured-logging field `trace_ref`. Always propagate `trace_ref`; never invent a new correlation field.",
+      "category": "ProjectConvention",
+      "confidence": 0.95,
+      "tags": ["larkspur", "logging", "observability"]
+    },
+    {
+      "id": "lesson-secrets",
+      "body": "The Larkspur service reads API credentials at runtime from Vault under the path `/larkspur/runtime`. Credentials are never read from a `.env` file or baked into the image.",
+      "category": "SecurityWarning",
+      "confidence": 0.95,
+      "tags": ["larkspur", "secrets", "security"]
+    }
+  ]
+}

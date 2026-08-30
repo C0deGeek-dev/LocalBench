@@ -1,0 +1,61 @@
+# LocalBench — native Rust workspace, the only shipping stack since the
+# v2.0.0 rewrite:
+#   - localbench-scoring   pure scoring math: trial/pure score, balanced-score
+#                          factors, cross-phase stability, TDS parsing + safety
+#                          gates, uplift A/B statistics, memory-quality gate
+#   - localbench-search    search strategy: candidate/beam, cross-profile
+#                          adoption, MTP-regime merge, candidate spaces,
+#                          edge/recovery ladders, smart seeds, probe targets
+#   - localbench-measure   measurement support: OOM/quality classification,
+#                          soak validation + stress recovery, stress prompt,
+#                          fingerprinted crash-safe trial cache
+#   - localbench           the app: CLI, launcher-contract consumer, best-config
+#                          export/profile store, machine-output discipline
+#
+# Shared primitives come from the public localx-llama crate tier via a
+# rev-pinned git dependency. MSRV 1.82 / edition 2021, exact-pinned deps.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/localbench-scoring",
+    "crates/localbench-search",
+    "crates/localbench-measure",
+    "crates/localbench",
+]
+
+[workspace.package]
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["David <David@c0degeek.dev>", "Bram (C0deGeek.dev)"]
+repository = "https://github.com/C0deGeek-dev/LocalBench"
+rust-version = "1.82"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+dbg_macro = "deny"
+
+[workspace.dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+thiserror = "=2.0.9"
+regex = "=1.11.3"
+tempfile = "=3.14.0"
+toml = "=0.8.23"
+tokio = { version = "=1.44.2", features = ["macros", "rt-multi-thread", "net", "time"] }
+reqwest = { version = "=0.12.11", features = ["json", "stream", "rustls-tls"], default-features = false }
+sysinfo = "=0.32.1"
+# The localx-llama pins and localbox-launcher move together: the graph must
+# hold a single localx-llama-core version (a split -core duplicates the
+# Launcher trait — the diamond-dep breakage), so advance the -core/-runtime
+# revs only together with a localbox-launcher re-pin whose own -core pin
+# matches.
+localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "b3b0c844e5a99e855e94865924e5f6bb4dec6fe6" }
+localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "b3b0c844e5a99e855e94865924e5f6bb4dec6fe6" }
+localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "b3b0c844e5a99e855e94865924e5f6bb4dec6fe6" }
+localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "53ddac2c9b023d743cb4470177c838ed94d9061f" }

@@ -1,0 +1,33 @@
+[package]
+name = "localbench"
+version = "5.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The LocalBench app: benchmark CLI, launcher-contract consumer, tuner best-config export and profile store, and machine-output discipline (clean JSON stdout, JSONL event stream)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+sysinfo = { workspace = true }
+tempfile = { workspace = true }
+localx-llama-core = { workspace = true }
+localx-llama-runtime = { workspace = true }
+localx-eval-core = { workspace = true }
+localbox-launcher = { workspace = true }
+localbench-scoring = { path = "../localbench-scoring" }
+localbench-search = { path = "../localbench-search" }
+localbench-measure = { path = "../localbench-measure" }
+
+[dev-dependencies]
+# Wire-format conformance tests only: validates real emitter output against
+# the committed schemas/ contract files.
+jsonschema = { version = "=0.26.2", default-features = false }

@@ -1,0 +1,191 @@
+You are a coding agent working inside a Windows PowerShell repository session. The user wants a practical diagnosis, not a tutorial. Read the full context, infer the likely root cause, and propose a small, safe patch plan. Treat benchmark output as evidence, but do not assume a single failed run proves the model is bad.
+
+Session goal:
+Support reliable llama.cpp benchmarking for a local MoE model that has both MTP speculative decoding and TurboQuant KV cache support. The user has a 24 GB CUDA GPU, about 29 GB free system RAM, and a model file that is close to the VRAM limit. LocalBench is expected to search launch parameters automatically, reject broken outputs, and save only usable configurations.
+
+Repository tree excerpt:
+
+localbench/
+  README.md
+  data/
+    long-coding-agent-fixture.txt
+  src/
+    LocalBench.psm1
+    cli.ps1
+    lib/
+      00-paths.ps1
+      10-hardware.ps1
+      20-models.ps1
+      30-runtimes.ps1
+      40-measurements.ps1
+      50-search.ps1
+      55-localbox-llamacpp-tuner.ps1
+      60-scoring.ps1
+      70-reports.ps1
+      80-export.ps1
+      90-tui-api.ps1
+  schemas/
+    benchmark-run.schema.json
+    bench-trial.schema.json
+    localbox-autobest-v1.schema.json
+
+LocalBox model entry:
+
+key: genesisv2
+description: Qwen3.6 35B A3B Genesis V2, GGUF with MTP sidecar tensors
+defaultContext: 131072
+quants:
+  mtp-apex:
+    file: Qwen3.6-35B-A3B-Uncensored-Genesis-MTP-APEX.gguf
+    sizeGB: 24.6
+    mode: mtpturbo
+    SpecType: draft-mtp
+    SpecDraftNMax: 2
+  mtp-apex-compact:
+    file: Qwen3.6-35B-A3B-Uncensored-Genesis-MTP-APEX-Compact.gguf
+    sizeGB: 22.9
+    mode: mtpturbo
+    SpecType: draft-mtp
+    SpecDraftNMax: 2
+
+User command:
+
+findbest genesisv2 -ContextKey 131k -Mode mtpturbo -Budget 100 -Optimize coding-agent -Profile pure
+
+Observed console output:
+
+=== llama.cpp tuner: genesisv2 (ctx=/131072, mode=mtpturbo, quant=mtp-apex, vram=24GB, prompt=long) ===
+  budget=100 optimize=coding-agent profile=pure search=beam/3 runs/trial=3 isMoE=True coarse=server
+  KV cache candidates: q8_0, f16, turbo3, turbo4
+  smart seeds: detected VRAM 24GB; available RAM 28.9GB; GGUF size 24.6GB; MoE expert CPU-offload boundary near NCpuMoe=35
+
+Waiting for llama-server............ (loading model, this may take a minute...)
+  [ 1] FAIL pp= 71.95 tg= 2.72 score=0.00 phase=baseline NCpuMoe=0 KvK=q8_0 KvV=q8_0
+baseline quality probe failed - phase 2 will continue, but review output quality before saving.
+All 3/3 completions failed output quality check (too short or repetitive).
+
+  -- mtp phase: testing no-MoE speculative decoding (SpecType=mtp)
+Waiting for llama-server........... (loading model, this may take a minute...)
+  [ 2] FAIL pp=0.00 tg=0.00 score=0.00 phase=mtp_no_moe NCpuMoe=0 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=2
+Waiting for llama-server........... (loading model, this may take a minute...)
+  [ 3] FAIL pp=0.00 tg=0.00 score=0.00 phase=mtp_no_moe NCpuMoe=0 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=3
+Waiting for llama-server..........
+  [ 4] FAIL pp=975.44 tg=16.30 score=0.00 phase=mtp_moe NCpuMoe=35 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=2
+Waiting for llama-server......
+  [ 5] FAIL pp=1004.07 tg=15.12 score=0.00 phase=mtp_moe NCpuMoe=25 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=2
+Waiting for llama-server......
+  [ 6] FAIL pp=954.93 tg=15.76 score=0.00 phase=mtp_moe NCpuMoe=30 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=2
+Waiting for llama-server......
+  [ 7] FAIL pp=900.00 tg=14.83 score=0.00 phase=mtp_moe NCpuMoe=40 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=2
+Waiting for llama-server........... (loading model, this may take a minute...)
+  [ 8] OOM pp=0.00 tg=0.00 score=0.00 phase=mtp_moe NCpuMoe=45 KvK=q8_0 KvV=q8_0 SpecType=mtp SpecDraftNMax=2
+
+Example bad completions captured in history:
+
+sample 1:
+///////////////////////////////
+///////////////////////////////
+///////////////////////////////
+
+sample 2:
+The the the the the the the the the the the the the the the the
+
+sample 3:
+`````````````````````````````````````````````````````````````
+
+Relevant code excerpt from src/lib/55-localbox-llamacpp-tuner.ps1:
+
+function Resolve-LlamaCppAllowedKvTypes {
+    param(
+        [string]$Mode,
+        [hashtable]$KvTypes
+    )
+
+    $values = @('q8_0')
+    if ($KvTypes.Contains('K')) { $values += @($KvTypes.K) }
+    if ($Mode -eq 'turboquant') {
+        if ($KvTypes.Contains('V')) { $values += @($KvTypes.V) }
+        $values += @('turbo3', 'turbo4')
+    }
+
+    return @($values | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Invoke-LlamaCppTrialServer {
+    param(
+        [string]$Mode,
+        [hashtable]$Overrides,
+        [int]$Runs = 3
+    )
+
+    $buildParams = @{
+        Mode = $Mode
+        Port = $port
+        ModelArgPath = $ModelArgPath
+    }
+
+    foreach ($k in @('KvK','KvV','NCpuMoe','SpecType','SpecDraftNMax')) {
+        if ($Overrides.Contains($k) -and $null -ne $Overrides[$k]) {
+            $buildParams[$k] = $Overrides[$k]
+        }
+    }
+
+    $args = Build-LlamaServerArgs @buildParams
+    Start-Process -FilePath $serverExe -ArgumentList $args
+
+    foreach ($i in 1..$Runs) {
+        $payload = @{
+            prompt = $script:LlamaCppTunerPrompt
+            n_predict = $script:LlamaCppTunerNPredict
+            cache_prompt = $false
+        }
+        $resp = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/completion" -Body ($payload | ConvertTo-Json)
+        $responseText = [string]$resp.content
+        $qualityOk = Test-LlamaCppOutputQuality -Text $responseText -MinChars 80 -MinWords 18
+        if (-not $qualityOk) { $startupOk = $false }
+    }
+}
+
+llama.cpp MTP notes from local help and upstream examples:
+
+- The mtpturbo binary supports --spec-type with values including mtp.
+- The same binary supports KV cache types q8_0, f16, turbo2, turbo3, and turbo4.
+- MTP testing should use a single slot for deterministic server trials: --parallel 1.
+- MoE CPU offload can prevent OOM, but too much GPU residency may still fail at model load time.
+- A server that returns HTTP 200 and emits timing data can still be a bad trial if the generated content is nonsense.
+
+History record excerpt after a proposed diagnostics patch:
+
+{
+  "phase": "mtp_moe",
+  "startup_ok": false,
+  "server_startup_ok": true,
+  "trial_valid": false,
+  "quality_ok": false,
+  "quality_fail_count": 3,
+  "error_type": "quality",
+  "samples": [
+    {
+      "pp_tps": 975.44,
+      "tg_tps": 16.30,
+      "quality_ok": false,
+      "chars": 184,
+      "words": 0,
+      "text_preview": "/////////////////////////////////////////////"
+    }
+  ]
+}
+
+Constraints:
+
+- Keep the patch small and compatible with existing saved profile schema.
+- Do not save a config just because the server started.
+- Do not reject a working MTP path only because the baseline without MTP produced bad text.
+- Distinguish OOM, startup failure, runtime API failure, and quality failure in history.
+- Prefer existing LocalBench helper functions over new framework-level abstractions.
+- Keep normal TurboQuant behavior unchanged for non-MTP models.
+- Keep the benchmark prompt deterministic across trials.
+
+User request:
+
+Explain what is most likely wrong with the current tuner behavior, identify the minimum code changes, and call out any remaining validation needed before saving an AutoBest profile. Be direct. Include a short patch plan and a short test plan. Keep the answer under 500 words.
