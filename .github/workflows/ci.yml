@@ -106,3 +106,20 @@ jobs:
             exit 1
           fi
           echo "no retired-stack language in docs, reports, examples, manifests, or schemas."
+
+  supply-chain:
+    name: supply-chain (advisories, licenses, bans, unused deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit,cargo-machete
+      # rust-toolchain.toml pins MSRV 1.82, whose cargo cannot parse a
+      # transitive dependency's edition-2024 manifest metadata; `+stable`
+      # runs the check with the toolchain installed above instead of the
+      # pinned override.
+      - run: cargo +stable deny --locked check
+      - run: cargo audit
+      - run: cargo machete
