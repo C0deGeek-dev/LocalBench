@@ -1,7 +1,9 @@
 [advisories]
 ignore = [
     # Transitive through reqwest/rustls. This is an unmaintained warning, not
-    # a known vulnerability.
+    # a known vulnerability. Owner: c0degeek-dev. First observed: 2026-08-30.
+    # Disposition: accept indefinitely — no direct control over this
+    # transitive dependency; revisit if reqwest/rustls drops it.
     "RUSTSEC-2025-0134",
 ]
 
