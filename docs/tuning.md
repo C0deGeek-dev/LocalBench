@@ -63,7 +63,17 @@ so a phase measuring nothing is never silent.
 
 1. **baseline** — the catalog defaults: the model's KV pair, and for MoE
    models its catalog `NCpuMoe` offload.
-2. **vram-fit** — fit the model into VRAM on the lever its architecture
+2. **kv-recovery** — runs *only* when the baseline started, stayed inside
+   memory, and still returned text the content gates rejected. That state says
+   the configuration is at fault rather than the model, and the KV cache pair
+   is the axis the search can already act on, so the baseline is re-measured
+   across the other allowed pairs (at most four). The first pair that produces
+   a usable measurement becomes the baseline every later phase builds on —
+   including the MoE offload sweep below, which pins the KV pair while it moves
+   the expert lever. If every allowed pair fails the same way, the run stops
+   and says so; that is a model or engine problem, not a KV type one. A content
+   failure is never treated as, or reported as, memory pressure.
+3. **vram-fit** — fit the model into VRAM on the lever its architecture
    actually has, read from the GGUF header (expert count and layer count).
    - *MoE models* sweep `--n-cpu-moe`: the baseline value, the smart-seed
      offload candidates (biased by your VRAM, RAM, and the GGUF size),
@@ -81,23 +91,23 @@ so a phase measuring nothing is never silent.
      layer count. A dense model whose baseline already starts spends no trials
      here (lowering `-ngl` from full offload only makes it slower). If the GGUF
      header cannot be read the model falls back to the catalog heuristic.
-3. **batching** — joint sweep of `(--ubatch-size, --batch-size)` with
+4. **batching** — joint sweep of `(--ubatch-size, --batch-size)` with
    `b >= ub`, pruned by OOM dominance: a pair equal-or-larger on both axes
    than an already-OOM'd pair is never measured.
-4. **flash-attn** — flash-attention on vs off, overlaid on the current beam.
-5. **memory-flags** — `--mlock`, `--no-mmap`, and both together.
-6. **cache-flags** — default SWA/cache behaviour vs `--swa-full`,
+5. **flash-attn** — flash-attention on vs off, overlaid on the current beam.
+6. **memory-flags** — `--mlock`, `--no-mmap`, and both together.
+7. **cache-flags** — default SWA/cache behaviour vs `--swa-full`,
    `--cache-prompt`, and both together with `CacheReuse=256`.
-7. **threads** — CPU thread sweep, only when the current best actually keeps
+8. **threads** — CPU thread sweep, only when the current best actually keeps
    MoE experts on the CPU (`NCpuMoe > 0`); candidates come from the smart
    seeds (your logical-core count, minus headroom for the balanced profile).
-8. **kv-types** — KV-cache encoding pairs. Native mode sweeps the model's
+9. **kv-types** — KV-cache encoding pairs. Native mode sweeps the model's
    baseline types; turbo-capable modes add `turbo3` / `turbo4` and their
    crosses.
-9. **refine** — a symmetric ±1..±5 fine-tune grid around every retained
+10. **refine** — a symmetric ±1..±5 fine-tune grid around every retained
    `NCpuMoe`, plus unmeasured stride-1 probes down from the lowest stable
    offload edge. Both are clamped to the model's valid range.
-10. **verify** — the winner is re-measured fresh. If the verification
+11. **verify** — the winner is re-measured fresh. If the verification
     measurement fails, every trace of that config is purged from the history
     and the next-best candidate is verified instead (up to three attempts),
     so a config that cannot start twice is never saved.
@@ -122,7 +132,11 @@ Each trial line shows the config **signature** (the `Name=value` pairs that
 define the candidate) and its score, or a stable `stage/reason` failure such as
 `response/missing_timings` or `content/thinking_only`. When available, the line
 links the candidate's unique server log; the final result and terminal error
-name the run manifest. The signature keys:
+name the run manifest. A content failure also records `failure_detail` in the
+manifest — the gate's own message plus a bounded, sanitized excerpt of the
+visible reply — so a flood, an empty answer and a merely terse one are
+distinguishable from the log without relaunching the server. The signature
+keys:
 
 - `NCpuMoe` — llama.cpp `--n-cpu-moe`, MoE expert layers kept on CPU. Lower
   moves more expert work to GPU: faster, more VRAM.

@@ -29,6 +29,14 @@ pub struct RunManifestRecord {
     pub failure_stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// The typed failure's own detail. Stage and reason classify a failure;
+    /// this is the sentence that says what actually happened — for a content
+    /// failure, the gate message plus a bounded excerpt of the rejected reply.
+    /// Without it a run manifest cannot distinguish a flood from an empty or
+    /// merely terse answer, because `diagnostic_excerpt` carries server log
+    /// text that is healthy in exactly that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_status: Option<i32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -125,6 +133,11 @@ impl RunLedger {
                 .and_then(|value| value.as_str().map(str::to_string))
                 .unwrap_or_else(|| "unknown".to_string())
         });
+        let failure_detail = trial
+            .failure
+            .as_ref()
+            .map(|failure| sanitize_excerpt(&failure.detail))
+            .filter(|detail| !detail.is_empty());
         let record = RunManifestRecord {
             run_id: self.run_id.clone(),
             attempt_id,
@@ -138,6 +151,7 @@ impl RunLedger {
             measurement_usable,
             failure_stage,
             failure_reason,
+            failure_detail,
             process_status: trial.process_status,
             log_path,
             diagnostic_excerpt: sanitize_excerpt(&trial.diagnostic_excerpt),
@@ -280,6 +294,74 @@ mod tests {
             telemetry: Telemetry::default(),
             ..Trial::default()
         }
+    }
+
+    /// LocalHub#160, second half. A content failure used to reach the manifest
+    /// as a bare stage/reason pair, while `diagnostic_excerpt` carried server
+    /// log text that is perfectly healthy for exactly this failure — so the
+    /// log could not distinguish a flood from an empty or merely terse reply,
+    /// and diagnosing it meant relaunching the server and replaying the
+    /// request.
+    #[test]
+    fn a_content_failure_records_what_the_model_actually_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = RunLedger::create(dir.path(), "run:content", 2).unwrap();
+        let mut trial = measured();
+        trial.measurement_usable = false;
+        trial.failure = Some(localbench_scoring::score::TrialFailure {
+            stage: localbench_scoring::score::TrialFailureStage::Content,
+            reason: localbench_scoring::score::TrialFailureReason::DegenerateContent,
+            detail: "degenerate response text; visible reply: ////////".to_string(),
+        });
+        ledger
+            .record(
+                "baseline",
+                "KvK=q8_0;KvV=q8_0",
+                "live",
+                &Overrides::new(),
+                &mut trial,
+                "now",
+            )
+            .unwrap();
+
+        let written = std::fs::read_to_string(ledger.path()).unwrap();
+        let record: RunManifestRecord = serde_json::from_str(written.trim()).unwrap();
+        let detail = record.failure_detail.unwrap_or_default();
+        assert!(
+            !detail.is_empty(),
+            "a content failure must carry its detail into the manifest"
+        );
+        assert!(
+            detail.contains("degenerate response text"),
+            "the gate message was dropped: {detail}"
+        );
+        assert!(
+            detail.contains("////////"),
+            "the rejected reply was dropped: {detail}"
+        );
+    }
+
+    /// A trial that succeeded has nothing to explain, and an empty detail must
+    /// not add a null-ish key to every healthy line.
+    #[test]
+    fn a_healthy_trial_records_no_failure_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = RunLedger::create(dir.path(), "run:ok", 2).unwrap();
+        ledger
+            .record(
+                "baseline",
+                "KvK=q8_0",
+                "live",
+                &Overrides::new(),
+                &mut measured(),
+                "now",
+            )
+            .unwrap();
+        let written = std::fs::read_to_string(ledger.path()).unwrap();
+        assert!(
+            !written.contains("failure_detail"),
+            "a healthy trial should not carry the key at all: {written}"
+        );
     }
 
     #[test]

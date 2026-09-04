@@ -349,16 +349,66 @@ fn validate_measurement_content(content: &str) -> Result<(), TrialFailure> {
         } else {
             TrialFailureReason::DegenerateContent
         };
-        return Err(failure(TrialFailureStage::Content, reason, smoke.error));
+        return Err(failure(
+            TrialFailureStage::Content,
+            reason,
+            content_failure_detail(&smoke.error, &smoke.visible_text),
+        ));
     }
     if !output_quality_ok(&smoke.visible_text, QUALITY_MIN_CHARS, QUALITY_MIN_WORDS) {
         return Err(failure(
             TrialFailureStage::Content,
             TrialFailureReason::DegenerateContent,
-            "visible response did not meet the tuner quality minimums",
+            content_failure_detail(
+                "visible response did not meet the tuner quality minimums",
+                &smoke.visible_text,
+            ),
         ));
     }
     Ok(())
+}
+
+/// Bytes of the rejected reply kept as evidence. Enough to tell a flood from
+/// a terse answer at a glance, short enough that a run manifest stays a log.
+const CONTENT_FAILURE_EXCERPT_CHARS: usize = 160;
+
+/// Pair a content-gate message with a bounded excerpt of the reply that was
+/// rejected.
+///
+/// Without the excerpt every content failure reaches the run manifest as a
+/// bare `degenerate_content`, and `diagnostic_excerpt` holds server log text
+/// which, for this class of failure, is entirely healthy and says nothing.
+/// Telling a `/` flood from an empty reply from a merely terse one then costs
+/// a relaunch and a replayed request. `failure` sanitizes the result.
+fn content_failure_detail(message: &str, visible: &str) -> String {
+    let visible = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    if visible.is_empty() {
+        return format!("{message}; visible reply was empty");
+    }
+    let kept: String = visible
+        .chars()
+        .take(CONTENT_FAILURE_EXCERPT_CHARS)
+        .collect();
+    let elided = visible.chars().count().saturating_sub(kept.chars().count());
+    if elided == 0 {
+        format!("{message}; visible reply: {kept}")
+    } else {
+        format!(
+            "{message}; visible reply (first {CONTENT_FAILURE_EXCERPT_CHARS} chars of {}): {kept}",
+            visible.chars().count()
+        )
+    }
+}
+
+/// A content-stage failure shaped like the real one, for tuner tests.
+#[cfg(test)]
+#[must_use]
+pub fn content_failure_for_test() -> TrialFailure {
+    failure(
+        TrialFailureStage::Content,
+        TrialFailureReason::DegenerateContent,
+        content_failure_detail("degenerate response text", "//////////////"),
+    )
 }
 
 /// Collapse whitespace, redact likely secrets, and cap diagnostic evidence.

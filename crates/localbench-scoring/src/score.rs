@@ -231,6 +231,25 @@ impl Trial {
                 .as_ref()
                 .is_some_and(|failure| failure.stage == TrialFailureStage::Readiness)
     }
+
+    /// Whether a different KV cache pair could plausibly fix this trial: the
+    /// server started, stayed inside memory, and still returned a reply the
+    /// content gates rejected.
+    ///
+    /// Deliberately separate from [`Self::needs_memory_recovery`] rather than
+    /// folded into it. That predicate routes to a memory ladder, which for a
+    /// MoE model pins the KV pair and sweeps only the expert lever — the wrong
+    /// axis entirely here — and it would have a content failure scored,
+    /// logged, and explained as memory pressure.
+    #[must_use]
+    pub fn needs_kv_recovery(&self) -> bool {
+        self.startup_ok
+            && !self.oom
+            && self
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.stage == TrialFailureStage::Content)
+    }
 }
 
 /// Host telemetry sampled during a trial. Every field optional — an absent

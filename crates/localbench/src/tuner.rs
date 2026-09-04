@@ -67,8 +67,9 @@ const MAX_VERIFICATION_ATTEMPTS: i64 = 3;
 /// The search phases in the order `run_tuner` runs them, so a phase can leave
 /// room for the ones that come after it. `verify` is not here: it spends from
 /// the reserve this list is subtracted from.
-const SEARCH_PHASES: [&str; 9] = [
+const SEARCH_PHASES: [&str; 10] = [
     "baseline",
+    "kv-recovery",
     "vram-fit",
     "batching",
     "flash-attn",
@@ -78,6 +79,13 @@ const SEARCH_PHASES: [&str; 9] = [
     "kv-types",
     "refine",
 ];
+
+/// Trials the KV-type recovery may spend. The recovery exists to prove a
+/// working KV pair exists, not to search for the best one — the `kv-types`
+/// phase does that later, from a baseline that can produce text. Four covers
+/// the identical/turbo3/turbo4/crossed pairs a turbo-capable build offers
+/// without letting a broken model spend the run proving it is broken.
+const KV_RECOVERY_MAX_TRIALS: usize = 4;
 
 /// Trials a phase that has not run yet is guaranteed. Beam retention
 /// multiplies what a phase wants to measure by its width, and a phase spends
@@ -270,21 +278,91 @@ pub fn run_tuner(
         &mut seen,
         events,
     );
-    let baseline_needs_recovery = baseline_candidate
+    let baseline_trial = baseline_candidate
         .as_ref()
-        .and_then(|candidate| candidate.trial.as_ref())
-        .is_some_and(Trial::needs_memory_recovery);
+        .and_then(|candidate| candidate.trial.as_ref());
+    let baseline_usable = baseline_trial.is_some_and(Trial::is_measurement_usable);
+    let baseline_needs_recovery = baseline_trial.is_some_and(Trial::needs_memory_recovery);
+    let baseline_needs_kv_recovery =
+        !baseline_usable && baseline_trial.is_some_and(Trial::needs_kv_recovery);
     let baseline_seed_failed = seed_failed(baseline_candidate.as_ref());
-    let baseline_unusable_without_recovery = baseline_candidate
-        .as_ref()
-        .and_then(|candidate| candidate.trial.as_ref())
-        .is_none_or(|trial| !trial.is_measurement_usable() && !trial.needs_memory_recovery());
-    if baseline_unusable_without_recovery {
+    if !baseline_usable && !baseline_needs_recovery && !baseline_needs_kv_recovery {
         events(
             "stopped: baseline reached no usable measurement and supplied no startup/OOM fit evidence; fix the reported contract/content failure before retuning"
                 .to_string(),
         );
         return None;
+    }
+
+    // ----- Phase 1b: KV-type recovery -----
+    // A baseline that started, stayed inside memory, and still produced text
+    // the content gates rejected has a likely culprit the search already knows
+    // about: the KV cache pair. Recovering here rather than by widening
+    // `needs_memory_recovery` keeps two things straight. A content failure is
+    // never reported as memory pressure, and the pair adopted below becomes
+    // the one the MoE vram-fit phase pins while it sweeps the expert lever —
+    // so the rest of the run cannot spend its budget re-measuring a pair that
+    // cannot produce text.
+    let mut effective_kv = params.baseline_kv.clone();
+    if baseline_needs_kv_recovery {
+        events("phase: kv-recovery".to_string());
+        let allowed = resolve_allowed_kv_types(&[], &params.baseline_kv, space_mode(params.mode));
+        let alternatives: Vec<KvPair> = kv_candidate_pairs(&allowed, false, false)
+            .into_iter()
+            .filter(|pair| *pair != params.baseline_kv)
+            .take(KV_RECOVERY_MAX_TRIALS)
+            .collect();
+        if alternatives.is_empty() {
+            events(
+                "kv-recovery: the allowed KV cache set offers no alternative to the baseline pair"
+                    .to_string(),
+            );
+        }
+        let mut recovered: Option<KvPair> = None;
+        for pair in alternatives {
+            let overrides = join_overrides(
+                &baseline,
+                &overrides_of(&[
+                    ("KvK", json!(pair.k.clone())),
+                    ("KvV", json!(pair.v.clone())),
+                ]),
+            );
+            let candidate = measure(
+                &overrides,
+                "kv-recovery",
+                &mut trials,
+                &mut history,
+                &mut seen,
+                events,
+            );
+            if candidate
+                .as_ref()
+                .and_then(|candidate| candidate.trial.as_ref())
+                .is_some_and(Trial::is_measurement_usable)
+            {
+                recovered = Some(pair);
+                break;
+            }
+        }
+        let Some(pair) = recovered else {
+            events(
+                "stopped: the baseline failed on content and every allowed KV cache pair failed the same way; the model or engine, not the KV cache type, is what needs fixing"
+                    .to_string(),
+            );
+            return None;
+        };
+        events(format!(
+            "kv-recovery: baseline recovered on KvK={};KvV={}; the rest of the run uses it",
+            pair.k, pair.v
+        ));
+        baseline = join_overrides(
+            &baseline,
+            &overrides_of(&[
+                ("KvK", json!(pair.k.clone())),
+                ("KvV", json!(pair.v.clone())),
+            ]),
+        );
+        effective_kv = pair;
     }
 
     // ----- Phase 2: VRAM fit -----
@@ -310,7 +388,7 @@ pub fn run_tuner(
             baseline_candidate.as_ref(),
             &baseline,
         )];
-        let coverage_pairs = vec![params.baseline_kv.clone()];
+        let coverage_pairs = vec![effective_kv.clone()];
         // Plan against this phase's own ceiling, not the whole remaining
         // budget: the per-phase reserve truncates the sweep, and a worklist
         // that ignored it would disclose full coverage for configurations the
@@ -351,10 +429,10 @@ pub fn run_tuner(
         // from there only makes it slower, so the branch runs only when the
         // baseline OOM'd. Without it a dense OOM leaves no surviving candidate
         // (LocalHub#76).
-        let allowed = resolve_allowed_kv_types(&[], &params.baseline_kv, space_mode(params.mode));
+        let allowed = resolve_allowed_kv_types(&[], &effective_kv, space_mode(params.mode));
         let kv_pairs = kv_candidate_pairs(&allowed, false, false);
         for overrides in dense_recovery_candidates(
-            &params.baseline_kv,
+            &effective_kv,
             &kv_pairs,
             space.baseline_ngl,
             space.block_count,
@@ -474,7 +552,7 @@ pub fn run_tuner(
     // ----- Phase 8: KV cache types -----
     events("phase: kv-types".to_string());
     for parent in beam_so_far(&history) {
-        let allowed = resolve_allowed_kv_types(&[], &params.baseline_kv, space_mode(params.mode));
+        let allowed = resolve_allowed_kv_types(&[], &effective_kv, space_mode(params.mode));
         for pair in kv_candidate_pairs(&allowed, false, false) {
             let overrides = join_overrides(
                 &parent.overrides,
@@ -735,6 +813,172 @@ mod tests {
             logical_cores: 16,
             beam_width: DEFAULT_BEAM_WIDTH,
         }
+    }
+
+    /// A runner that mimics LocalHub#159: one KV pair starts, runs, reports
+    /// healthy timings and returns a `/` flood; every other pair answers.
+    struct DegenerateKvRunner {
+        broken: KvPair,
+        measured: Vec<(String, String)>,
+    }
+
+    impl DegenerateKvRunner {
+        fn pair_of(overrides: &Overrides) -> KvPair {
+            let read = |key: &str| {
+                overrides
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            KvPair {
+                k: read("KvK"),
+                v: read("KvV"),
+            }
+        }
+    }
+
+    impl TrialRunner for DegenerateKvRunner {
+        fn measure(&mut self, overrides: &Overrides, phase: &str) -> Trial {
+            let pair = Self::pair_of(overrides);
+            self.measured
+                .push((phase.to_string(), format!("{};{}", pair.k, pair.v)));
+            if pair == self.broken {
+                // The shape that matters: the process is healthy in every way
+                // the tuner can see, and only the text is wrong.
+                return Trial {
+                    startup_ok: true,
+                    oom: false,
+                    measurement_usable: false,
+                    process_status: Some(1),
+                    failure: Some(crate::trial::content_failure_for_test()),
+                    ..Trial::default()
+                };
+            }
+            let moe = overrides
+                .get("NCpuMoe")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0) as f64;
+            Trial {
+                startup_ok: true,
+                oom: false,
+                measurement_usable: true,
+                pp_tps: 900.0 - moe,
+                tg_tps: 100.0 - moe,
+                variance: Some(0.02),
+                telemetry: Telemetry::default(),
+                ..Trial::default()
+            }
+        }
+    }
+
+    /// LocalHub#160. A baseline that starts, stays inside memory, and returns
+    /// degenerate text used to end the run at trial one — while the identical
+    /// defect surfacing as a readiness timeout recovered and finished. The
+    /// working pair was already in the allowed set the search had built.
+    #[test]
+    fn a_degenerate_baseline_recovers_on_another_kv_pair_instead_of_ending_the_run() {
+        let mut runner = DegenerateKvRunner {
+            broken: KvPair {
+                k: "q8_0".to_string(),
+                v: "q8_0".to_string(),
+            },
+            measured: vec![],
+        };
+        let mut events = Vec::new();
+        let mut turbo = params();
+        turbo.mode = localx_llama_core::Mode::Turboquant;
+        let outcome = run_tuner(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &turbo,
+            &mut |line| events.push(line),
+        )
+        .expect("a degenerate baseline recovers onto a working KV pair");
+
+        assert!(
+            runner
+                .measured
+                .iter()
+                .any(|(phase, _)| phase == "kv-recovery"),
+            "the recovery phase never ran: {:?}",
+            runner.measured
+        );
+        assert!(
+            events
+                .iter()
+                .any(|line| line.contains("kv-recovery: baseline recovered")),
+            "recovery was not reported under its own name: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|line| line.starts_with("stopped:")),
+            "the run stopped despite a working pair being available: {events:?}"
+        );
+
+        // The winner must not be the pair that cannot produce text.
+        let winner_kv = DegenerateKvRunner::pair_of(&outcome.winner.overrides);
+        assert_ne!(
+            winner_kv, runner.broken,
+            "the run selected the KV pair that returns degenerate text"
+        );
+
+        // And the rest of the run must follow the recovered pair rather than
+        // re-measuring the broken one: that is what makes the recovery worth
+        // more than one lucky trial.
+        let broken_after_recovery = runner
+            .measured
+            .iter()
+            .filter(|(phase, pair)| {
+                phase != "baseline" && *pair == format!("{};{}", runner.broken.k, runner.broken.v)
+            })
+            .count();
+        assert_eq!(
+            broken_after_recovery, 0,
+            "later phases kept re-measuring the broken pair: {:?}",
+            runner.measured
+        );
+    }
+
+    /// When no allowed pair works, stopping is right — but the message has to
+    /// say that every pair was tried, not that the baseline supplied no
+    /// evidence.
+    #[test]
+    fn an_unrecoverable_content_failure_stops_only_after_every_pair_and_says_so() {
+        struct AlwaysDegenerate;
+        impl TrialRunner for AlwaysDegenerate {
+            fn measure(&mut self, _overrides: &Overrides, _phase: &str) -> Trial {
+                Trial {
+                    startup_ok: true,
+                    oom: false,
+                    measurement_usable: false,
+                    failure: Some(crate::trial::content_failure_for_test()),
+                    ..Trial::default()
+                }
+            }
+        }
+        let mut events = Vec::new();
+        let mut turbo = params();
+        turbo.mode = localx_llama_core::Mode::Turboquant;
+        let outcome = run_tuner(
+            &mut AlwaysDegenerate,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &turbo,
+            &mut |line| events.push(line),
+        );
+        assert!(
+            outcome.is_none(),
+            "an unusable model must not produce a winner"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|line| line.contains("every allowed KV cache pair failed the same way")),
+            "the stop message did not say the recovery was exhausted: {events:?}"
+        );
     }
 
     /// Beam retention multiplies what a phase wants to measure, and a phase

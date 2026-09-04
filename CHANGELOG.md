@@ -4,6 +4,27 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **A degenerate baseline now recovers on another KV cache pair instead of
+  ending the tuning run.** A baseline that started, stayed inside memory, and
+  returned text the content gates rejected used to stop the run at trial one,
+  while the identical defect surfacing as a readiness timeout entered the
+  recovery ladder and finished — the outcome decided by nothing but which
+  stage the engine happened to fail at. The new bounded `kv-recovery` phase
+  re-measures the baseline across the other allowed KV pairs, adopts the first
+  that produces a usable measurement as the baseline the rest of the run builds
+  on, and stops only once every allowed pair has failed the same way, saying
+  so. It is deliberately not folded into the memory-recovery predicate: that
+  ladder pins the KV pair while sweeping the expert lever on MoE models, and
+  would have a content failure scored and reported as memory pressure.
+- **A content failure now records what the model actually said.** Stage and
+  reason classified the failure, but the typed failure's own detail never
+  reached the run manifest, and `diagnostic_excerpt` carries server log text
+  that is healthy for exactly this class of failure. Manifest records gained
+  `failure_detail`: the gate's message plus a bounded, sanitized excerpt of the
+  rejected reply, so a flood, an empty answer and a merely terse one can be
+  told apart from the log without relaunching the server and replaying the
+  request.
+
 ## v5.0.0 - 2026-08-30
 
 - Began a new public Git history under PolyForm Noncommercial 1.0.0. Versions
