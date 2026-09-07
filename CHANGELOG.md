@@ -4,6 +4,19 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **The `mtpturbo` engine mode is retired, following LocalBox.** `findbest
+  --mode mtpturbo` is gone, and so is the one piece of search behaviour it
+  owned: `mtp_minimum_n_cpu_moe`, the MoE offload floor that existed because
+  mtpturbo's draft head competed with the main model for VRAM, applied to no
+  other mode and is deleted rather than left returning zero. MTP tuning itself
+  is untouched — the draft candidates key off the catalog's `SpecType`, not the
+  engine — so an MTP-capable model still tunes on `native`. Both schemas drop
+  the value from their `mode` enum without a document-schema bump: a store
+  written before the retirement keeps working, because LocalBox's reader skips
+  entries naming a mode it no longer knows and still serves the `native` and
+  `turboquant` entries beside them. `--mode mtpturbo` now says the mode was
+  retired and names what is left, rather than reporting a spelling mistake.
+
 - **A degenerate baseline now recovers on another KV cache pair instead of
   ending the tuning run.** A baseline that started, stayed inside memory, and
   returned text the content gates rejected used to stop the run at trial one,

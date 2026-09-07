@@ -21,9 +21,9 @@ use localbench_search::seeds::SmartSeeds;
 use localbench_search::space::{
     baseline_recovery_seed, dense_recovery_candidates, expand_phase_candidates,
     fine_tune_n_cpu_moe_candidates, kv_candidate_pairs, moe_candidate_values,
-    moe_coverage_worklist, moe_edge_refine_values, mtp_minimum_n_cpu_moe,
-    recovery_n_cpu_moe_candidates, resolve_allowed_kv_types, resolve_tuner_budget, seed_failed,
-    swa_flag_overlays, KvPair, SearchSpace,
+    moe_coverage_worklist, moe_edge_refine_values, recovery_n_cpu_moe_candidates,
+    resolve_allowed_kv_types, resolve_tuner_budget, seed_failed, swa_flag_overlays, KvPair,
+    SearchSpace,
 };
 use serde_json::json;
 
@@ -134,7 +134,6 @@ pub fn space_mode(mode: localx_llama_core::Mode) -> localbench_search::space::Mo
     match mode {
         localx_llama_core::Mode::Native => localbench_search::space::Mode::Native,
         localx_llama_core::Mode::Turboquant => localbench_search::space::Mode::Turboquant,
-        localx_llama_core::Mode::Mtpturbo => localbench_search::space::Mode::Mtpturbo,
         localx_llama_core::Mode::PrismMl => localbench_search::space::Mode::PrismMl,
     }
 }
@@ -368,12 +367,9 @@ pub fn run_tuner(
     // ----- Phase 2: VRAM fit -----
     events("phase: vram-fit".to_string());
     if space.is_moe {
-        let minimum = mtp_minimum_n_cpu_moe(
-            space,
-            seeds,
-            space_mode(params.mode),
-            !space.mtp_draft_candidates.is_empty(),
-        );
+        // The MoE sweep has no floor: the only mode that ever imposed one was
+        // mtpturbo, whose draft head competed with the main model for VRAM.
+        let minimum = 0;
         let moe_values = if baseline_needs_recovery || baseline_seed_failed {
             recovery_n_cpu_moe_candidates(
                 space.baseline_n_cpu_moe,

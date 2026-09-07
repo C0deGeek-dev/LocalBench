@@ -22,7 +22,7 @@
           "quant": { "type": "string" },
           "contextKey": { "type": "string" },
           "contextTokens": { "type": "integer" },
-          "mode": { "enum": ["native", "turboquant", "mtpturbo", "prismml"] },
+          "mode": { "enum": ["native", "turboquant", "prismml"] },
           "vramGB": { "type": "integer" },
           "prompt_length": { "enum": ["short", "long"] },
           "profile": { "enum": ["pure", "balanced"] },

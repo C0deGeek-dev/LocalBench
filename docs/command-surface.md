@@ -22,7 +22,7 @@ localbench instruments
     only when every instrument passes its known-good/known-bad pair.
 
 localbench findbest --model <key> [--context <k>]
-                    [--mode native|turboquant|mtpturbo|prism] [--quant <q>]
+                    [--mode native|turboquant|prism] [--quant <q>]
                     [--profile pure|balanced|both] [--budget <n>]
                     [--runs <n>] [--optimize gen|prompt|both|coding-agent]
                     [--no-save] [--no-cache] [--startup-timeout <secs>]

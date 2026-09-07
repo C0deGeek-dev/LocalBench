@@ -23,6 +23,13 @@ The best-config document schema remains `1`; its independent per-entry
 measurement compatibility is currently `tuner_version: 5`. Older entries may
 remain in a store but current readers do not rank or replay them.
 
+The `mode` enum in `tuner-best-config` and `localbox-autobest-v1` dropped
+`mtpturbo` when that engine mode was retired, without a document-schema bump.
+A store written before the retirement is not invalidated by this: LocalBox's
+reader skips entries whose mode it no longer recognises and still serves the
+`native`/`turboquant` entries beside them, so an old file keeps working while
+no longer being something a current producer can emit.
+
 **Cross-repo conformance.** The launcher best-config store is a cross-project
 contract with LocalBox. It is conformance-tested in Rust:
 `crates/localbench/tests/launcher_contract_localbox.rs` checks LocalBox's

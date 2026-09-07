@@ -21,7 +21,7 @@ usage: localbench <command> [options]
 commands:
   version                    print the version envelope (JSON)
   instruments                run the deterministic instrument self-tests
-  findbest --model <key> [--context <k>] [--mode native|turboquant|mtpturbo|prism]
+  findbest --model <key> [--context <k>] [--mode native|turboquant|prism]
            [--quant <q>] [--profile pure|balanced|both] [--budget <n>]
            [--beam-width <1..100>]
            [--runs <n>] [--optimize gen|prompt|both|coding-agent] [--no-save]
@@ -70,12 +70,14 @@ fn parse_mode(value: Option<&str>) -> Result<Option<localx_llama_core::Mode>, St
         None => return Ok(None),
         Some("native") => localx_llama_core::Mode::Native,
         Some("turboquant") => localx_llama_core::Mode::Turboquant,
-        Some("mtpturbo") => localx_llama_core::Mode::Mtpturbo,
         Some("prism" | "prismml") => localx_llama_core::Mode::PrismMl,
         Some(other) => {
-            return Err(format!(
-                "unknown --mode '{other}' (use native|turboquant|mtpturbo|prism)"
-            ))
+            // A mode that was offered once is named as retired: reporting it
+            // as unknown sends the user hunting for a spelling mistake.
+            return Err(match localbox_launcher::catalog::retired_mode_note(other) {
+                Some(note) => format!("--mode '{other}': {note}"),
+                None => format!("unknown --mode '{other}' (use native|turboquant|prism)"),
+            });
         }
     };
     Ok(Some(mode))
@@ -829,6 +831,22 @@ mod tests {
             Mode::PrismMl
         );
         assert_eq!(resolve_mode("ordinary", None, None).unwrap(), Mode::Native);
+    }
+
+    #[test]
+    fn a_retired_mode_is_named_as_retired_not_as_a_typo() {
+        let refused = parse_mode(Some("mtpturbo")).expect_err("mtpturbo is no longer tunable");
+        assert!(refused.contains("was retired"), "{refused}");
+        assert!(refused.contains("turboquant"), "{refused}");
+        assert!(
+            !refused.contains("unknown --mode"),
+            "a retired mode must not read as a spelling mistake: {refused}"
+        );
+
+        // A genuine typo still gets the unknown-mode listing of live modes.
+        let typo = parse_mode(Some("turbowuant")).expect_err("not a mode");
+        assert!(typo.contains("unknown --mode 'turbowuant'"), "{typo}");
+        assert!(typo.contains("native|turboquant|prism"), "{typo}");
     }
 
     #[test]

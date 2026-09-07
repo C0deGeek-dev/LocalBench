@@ -22,7 +22,7 @@ mock) can drive the tuner. The capability groups:
 |---|---|
 | Model resolution | model key → definition; definition + quant → resolved GGUF path; context key resolution and token values; vision-module path when the model has one |
 | Hardware | total VRAM in GB |
-| Binary resolution | path to the `llama-server` binary per mode (native / turboquant / mtpturbo / PrismML), installing when sanctioned; per-mode install roots |
+| Binary resolution | path to the `llama-server` binary per mode (native / turboquant / PrismML), installing when sanctioned; per-mode install roots |
 | Argument / KV | the `llama-server` argv for a trial config; available KV cache types per mode; unsupported-type rejection |
 | Server lifecycle | a free TCP port; block until the server responds; stop; record the active backend session |
 | Paths | expand `~` and `%VAR%` style path spellings |

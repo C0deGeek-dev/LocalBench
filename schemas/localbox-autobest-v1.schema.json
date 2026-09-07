@@ -25,7 +25,7 @@
           "quant": { "type": "string" },
           "contextKey": { "type": "string" },
           "contextTokens": { "type": "integer" },
-          "mode": { "type": "string", "enum": ["native", "turboquant", "mtpturbo", "prismml"] },
+          "mode": { "type": "string", "enum": ["native", "turboquant", "prismml"] },
           "vramGB": { "type": "integer" },
           "prompt_length": { "type": "string", "enum": ["short", "long"] },
           "vision": { "type": "boolean", "description": "Tuned with the vision encoder (mmproj) loaded in every trial." },

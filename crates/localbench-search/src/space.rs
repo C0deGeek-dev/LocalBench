@@ -15,7 +15,6 @@ use crate::seeds::SmartSeeds;
 pub enum Mode {
     Native,
     Turboquant,
-    Mtpturbo,
     PrismMl,
 }
 
@@ -116,7 +115,7 @@ pub fn resolve_allowed_kv_types(allowed: &[String], baseline: &KvPair, mode: Mod
     } else if matches!(mode, Mode::Native | Mode::PrismMl) {
         values.push(baseline.k.clone());
     }
-    if matches!(mode, Mode::Turboquant | Mode::Mtpturbo) {
+    if matches!(mode, Mode::Turboquant) {
         values.push(baseline.k.clone());
         values.push(baseline.v.clone());
         values.push("turbo3".to_string());
@@ -487,34 +486,6 @@ pub fn dense_recovery_candidates(
     candidates
 }
 
-/// The minimum NCpuMoe the MTP regime starts from. MTP's draft head needs
-/// VRAM headroom: when the main GGUF is already near/above device VRAM (or the
-/// card is 24GB or smaller), start near the known offload boundary instead of
-/// testing GPU-only MoE or tiny CPU-offload values. Zero (no floor) off the
-/// mtpturbo mode or for dense models.
-#[must_use]
-pub fn mtp_minimum_n_cpu_moe(
-    space: &SearchSpace,
-    seeds: &SmartSeeds,
-    mode: Mode,
-    mtp_enabled: bool,
-) -> i64 {
-    if !mtp_enabled || !space.is_moe || mode != Mode::Mtpturbo {
-        return 0;
-    }
-    let base = space.baseline_n_cpu_moe;
-    // The floor applies when the main GGUF is within 2GB of device VRAM (the
-    // draft head will not fit above the boundary) or the card is 24GB or less.
-    let gguf_near_vram =
-        seeds.gguf_size_gb > 0.0 && seeds.gguf_size_gb >= (f64::from(seeds.vram_gb) - 2.0);
-    let floor = if seeds.vram_gb > 0 && (gguf_near_vram || seeds.vram_gb <= 24) {
-        (base - 30).max(5)
-    } else {
-        0
-    };
-    floor.clamp(0, space.moe_upper)
-}
-
 /// A planned coverage worklist: seeds × MoE values × KV pairs, truncated to
 /// the remaining budget, with the planned/skipped counts reported so silent
 /// truncation never reads as full coverage.
@@ -675,13 +646,17 @@ mod tests {
             resolve_allowed_kv_types(&[], &baseline, Mode::Turboquant),
             vec!["q8_0", "turbo3", "turbo4"]
         );
-        // An explicit allowlist wins, turbo types still appended on turbo modes.
+        // An explicit allowlist wins, turbo types still appended on the turbo mode.
         assert_eq!(
-            resolve_allowed_kv_types(&["f16".to_string()], &baseline, Mode::Mtpturbo),
+            resolve_allowed_kv_types(&["f16".to_string()], &baseline, Mode::Turboquant),
             vec!["f16", "q8_0", "turbo3", "turbo4"]
         );
         assert_eq!(
             resolve_allowed_kv_types(&["f16".to_string()], &baseline, Mode::Native),
+            vec!["f16"]
+        );
+        assert_eq!(
+            resolve_allowed_kv_types(&["f16".to_string()], &baseline, Mode::PrismMl),
             vec!["f16"]
         );
     }
@@ -869,38 +844,6 @@ mod tests {
             .collect();
         assert_eq!(ngls[0], 499);
         assert!(!ngls.contains(&999));
-    }
-
-    #[test]
-    fn mtp_minimum_needs_mtpturbo_moe_and_a_tight_card() {
-        let axes = ModelAxes {
-            n_cpu_moe: Some(40),
-            ..ModelAxes::default()
-        };
-        let space = resolve_search_space(&axes, 128, -1);
-        let tight = seeds_with(vec![], 24, 23.0);
-        assert_eq!(
-            mtp_minimum_n_cpu_moe(&space, &tight, Mode::Mtpturbo, true),
-            10
-        );
-        // GGUF near VRAM also floors it on a big card.
-        let big_card_big_model = seeds_with(vec![], 48, 47.0);
-        assert_eq!(
-            mtp_minimum_n_cpu_moe(&space, &big_card_big_model, Mode::Mtpturbo, true),
-            10
-        );
-        // Roomy card, small model: no floor.
-        let roomy = seeds_with(vec![], 48, 20.0);
-        assert_eq!(
-            mtp_minimum_n_cpu_moe(&space, &roomy, Mode::Mtpturbo, true),
-            0
-        );
-        // Off outside mtpturbo / MTP-off / dense.
-        assert_eq!(mtp_minimum_n_cpu_moe(&space, &tight, Mode::Native, true), 0);
-        assert_eq!(
-            mtp_minimum_n_cpu_moe(&space, &tight, Mode::Mtpturbo, false),
-            0
-        );
     }
 
     #[test]
