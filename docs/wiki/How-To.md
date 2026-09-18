@@ -15,9 +15,12 @@ localbench findbest --model q36plus --context 64k --budget 20   # bound the sear
 localbench findbest --model q36plus --context 64k --no-save     # measure only
 ```
 
-The tuner sweeps MoE CPU offload, batching, flash-attention, memory flags, SWA,
-CPU threads, and KV-cache types, re-measures the winner fresh before trusting
-it, and saves the result. It measures templated chat with LocalBox's
+llama.cpp's own memory fitter (`llama-fit-params`, shipped with each engine)
+places the starting point, so the tuner no longer finds the VRAM edge by
+running out of memory (`--no-oracle` turns that off). The tuner then sweeps MoE
+CPU offload around that edge, batching, flash-attention, memory flags, SWA, CPU
+threads, and KV-cache types, re-measures the winner fresh before trusting it,
+and saves the result. It measures templated chat with LocalBox's
 single-session defaults. Decisive measurements persist in the trial cache, so a
 repeated or interrupted tune skips configs it already measured; every attempted
 or cached candidate is also recorded in a run manifest under

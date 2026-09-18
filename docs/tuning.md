@@ -8,8 +8,8 @@ candidate is measured through `llama-server` — the same binary LocalBox will
 actually launch — via the OpenAI-compatible `/v1/chat/completions` endpoint
 with a deterministic user message and bounded generation controls. LocalBench
 reads visible assistant content and llama.cpp's prompt/decode timing fields;
-there is no raw-completion fallback and nothing is approximated with
-`llama-bench`. Turboquant candidates run through the forked runtime so
+there is no raw-completion fallback and no saved or ranked number is
+approximated with `llama-bench` — it only screens candidates (below). Turboquant candidates run through the forked runtime so
 `turbo3` / `turbo4` KV types are measured on the binary that supports them.
 
 Candidate launches reuse LocalBox's settings overlay and single-session
@@ -23,7 +23,7 @@ localbench findbest --model <key> [--context <k>]
                     [--profile pure|balanced|both] [--budget <n>]
                     [--beam-width <1..100>]
                     [--runs <n>] [--optimize gen|prompt|both|coding-agent]
-                    [--no-save] [--no-cache]
+                    [--no-save] [--no-cache] [--no-oracle] [--no-screen]
 ```
 
 Model-file quants and KV-cache encodings are separate axes. `--quant` selects
@@ -43,6 +43,52 @@ LocalBench honors the catalog's required engine. For example, `tbonsai27b`
 selects the PrismML build automatically; `--mode prism` is accepted explicitly,
 while an incompatible override such as `--mode native` is rejected before any
 trial starts. AutoBest stores the shared wire spelling `prismml`.
+
+## The memory-fit oracle
+
+Every llama.cpp build ships `llama-fit-params`, the allocator's own memory
+fitter: given a model and a launch shape it reports — in seconds, without
+loading tensor data — how many layers, and which MoE expert tensors, fit in
+free VRAM. `findbest` uses the fitter that ships beside the engine it tunes as
+an oracle for *where* a candidate fits, never for how fast it runs:
+
+- **baseline** starts at the fitted placement (`NCpuMoe` for a MoE model,
+  `NGpuLayers` for a dense one that does not fit whole) instead of the
+  catalog default;
+- **vram-fit** probes at most two steps past it — the fitter keeps about
+  1 GiB free per device, so one or two more layers often still start — and
+  stops at the first failure. If the fitted placement itself runs out of
+  memory it backs off one step at a time (at most three) and says so. The
+  distance this host runs from the fitted edge carries into later phases;
+- a later phase that changes the memory shape (KV type, batch size, flash
+  attention, cache or memory flags) keeps its intent but gets the placement
+  that shape needs, instead of spending a trial proving the old one no
+  longer fits;
+- a candidate llama.cpp cannot create at all (for example a quantized V
+  cache without flash attention) is skipped with the fitter's reason
+  instead of spending a trial on a server that cannot start;
+- **refine** measures only the neighbours (±2) of the retained placement.
+
+Every number the tuner ranks, caches, verifies, or saves is still a real
+`llama-server` measurement; the oracle only decides which candidates are
+worth one. Its answers appear in the progress lines (`oracle: fits with
+NCpuMoe=38 (21218 MiB used, 1655 MiB free on CUDA0 …)`). When the engine has
+no fitter, the fitter cannot read the model, or `--no-oracle` is passed, the
+search below runs unchanged.
+
+## The llama-bench screen
+
+Four phases vary only settings `llama-bench` can sweep inside one process —
+**batching** (ubatch/batch), **flash-attn**, **threads**, and **kv-types**
+(including `turbo3`/`turbo4` through the turboquant build's own `llama-bench`).
+For each beam parent, `findbest` runs the phase's candidates through one
+`llama-bench` process (2048 prompt and 128 generated tokens, two repetitions),
+ranks them by the same objective the tuner optimizes, and measures only the
+best two on the server (one per parent for flash attention). The screen is
+never a result: its numbers are not scored, cached, ranked against server
+trials, verified, or saved, and a screen that cannot answer leaves the phase
+measuring every candidate. `--no-screen` measures every candidate on the
+server. Memory and cache flags keep server-only semantics and are not screened.
 
 ## What gets searched
 
@@ -111,10 +157,14 @@ so a phase measuring nothing is never silent.
 9. **kv-types** — KV-cache encoding pairs. Native mode sweeps the model's
    baseline types; turbo-capable modes add `turbo3` / `turbo4` and their
    crosses.
-10. **refine** — a symmetric ±1..±5 fine-tune grid around every retained
+10. **spec-ngram** — n-gram speculative decoding (`--spec-type ngram-mod`),
+    which drafts from the context's own n-grams and needs no draft model.
+    Tried for models whose catalog sets no speculative type or draft model,
+    and kept only when the measured score wins.
+11. **refine** — a symmetric ±1..±5 fine-tune grid around every retained
    `NCpuMoe`, plus unmeasured stride-1 probes down from the lowest stable
    offload edge. Both are clamped to the model's valid range.
-11. **verify** — the winner is re-measured fresh. If the verification
+12. **verify** — the winner is re-measured fresh. If the verification
     measurement fails, every trace of that config is purged from the history
     and the next-best candidate is verified instead (up to three attempts),
     so a config that cannot start twice is never saved.
@@ -155,6 +205,8 @@ keys:
   **memory-flags** above for how each build spells them.
 - `KvK` / `KvV` — KV-cache types for keys/values, passed as `-ctk` / `-ctv`.
 - `SwaFull` / `CachePrompt` / `CacheReuse` — SWA and prompt-cache flags.
+- `SpecType` — speculative decoding type (`ngram-mod` from the spec-ngram
+  phase).
 
 KV-cache values are llama.cpp cache encodings such as `f16`, `q8_0`, or, in
 turboquant builds, `turbo3` / `turbo4`. They are not GGUF model quants such

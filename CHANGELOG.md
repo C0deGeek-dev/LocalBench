@@ -4,6 +4,32 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **`llama-bench` screens the cheap axes; only the best reach the server.**
+  Batching, flash attention, threads, and KV types are swept in one
+  `llama-bench` process per beam parent and ranked by the tuner's own
+  objective; only the top two per parent get a full server trial. Screen
+  numbers are never scored, cached, or saved. `--no-screen` restores
+  server-only measurement; the findbest JSON reports `search_aids`.
+
+- **A candidate llama.cpp cannot create is skipped.** The memory fitter
+  already knows, in under a second, that for example a quantized V cache needs
+  flash attention; such candidates are logged with the reason instead of
+  costing a server start.
+
+- **N-gram speculative decoding is a tuned axis.** A new spec-ngram phase tries
+  `--spec-type ngram-mod` for models without a catalog speculative type or
+  draft model and keeps it only when the measured score wins.
+
+- **`findbest` asks llama.cpp where a model fits instead of finding out by
+  crashing.** The engine's own `llama-fit-params` places the baseline and
+  bounds the VRAM search: the VRAM-fit phase probes at most two steps past the
+  fitted placement (backing off one step at a time if the fitter was
+  optimistic), later phases that change the memory shape get the placement
+  that shape needs, and refinement measures only the fitted edge's
+  neighbours. The out-of-memory ladders that located the edge by trial remain
+  for engines without a fitter and behind `--no-oracle`. Every saved number is
+  still a real server measurement.
+
 - **Memory-flag trials work on the native engine and follow your RAM.** Current
   mainline llama.cpp rejects `--no-mmap` / `--mlock` (they became
   `--load-mode`), so every memory-flags trial on the native engine failed to

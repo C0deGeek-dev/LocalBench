@@ -25,13 +25,19 @@ localbench findbest --model <key> [--context <k>]
                     [--mode native|turboquant|prism] [--quant <q>]
                     [--profile pure|balanced|both] [--budget <n>]
                     [--runs <n>] [--optimize gen|prompt|both|coding-agent]
-                    [--no-save] [--no-cache] [--startup-timeout <secs>]
+                    [--no-save] [--no-cache] [--no-oracle] [--no-screen]
+                    [--startup-timeout <secs>]
     Tune the model live against the launcher (LocalBox) and save the
     winner to ~/.local-llm/tuner/best-<key>.json. Candidates are measured as
     templated chat under LocalBox's single-session defaults. Decisive
     measurements persist in the trial cache and every live/cached attempt is
     recorded under ~/.local-llm/logs/tuner/run-<run-id>.jsonl; the JSON result
-    includes that diagnostics path. See the tuning guide.
+    includes that diagnostics path. llama.cpp's memory fitter
+    (llama-fit-params, shipped with each engine) places the baseline and
+    bounds the VRAM search; --no-oracle searches by trial alone. llama-bench
+    screens the batching, flash-attention, thread and KV-type candidates so
+    only the best reach a server trial; --no-screen measures every one. The
+    JSON result's search_aids names which helpers ran. See the tuning guide.
     Models with a catalog-required engine select it automatically; an
     incompatible explicit --mode is rejected before any trial starts.
     --startup-timeout sets the per-trial startup budget in seconds

@@ -104,6 +104,29 @@ pub fn trial_launch_params(candidate: LaunchParams, settings: &LaunchParams) -> 
     request.params
 }
 
+/// The launch parameters a candidate runs with: its own overrides over
+/// LocalBox settings and the single-session defaults, with memory-mapping
+/// flags spelled the way the build under test accepts them. Shared by the
+/// live trial and the memory-fit oracle so both see the same server shape.
+///
+/// # Errors
+/// The deserialisation error when `overrides` do not fit the tuned-profile
+/// schema.
+pub fn candidate_launch_params(
+    launcher: &dyn Launcher,
+    target: &TrialTarget,
+    overrides: &Overrides,
+) -> Result<LaunchParams, String> {
+    // The map's PascalCase keys are the typed schema's wire spelling.
+    let typed: localx_llama_core::tuner::Overrides = serde_json::from_value(
+        serde_json::Value::Object(overrides.clone().into_iter().collect()),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut params = trial_launch_params(typed.to_launch_params(), &target.settings_params);
+    params.load_flags = launcher.server_capabilities(target.mode).load_flags();
+    Ok(params)
+}
+
 /// Session-shaping values represented in the run fingerprint. Candidate-owned
 /// values remain in the per-entry candidate signature and override this base.
 #[must_use]
@@ -1036,18 +1059,10 @@ impl TrialRunner for LiveRunner<'_> {
             diagnostic: Some(diagnostic(None)),
             ..Trial::default()
         };
-        // The map's PascalCase keys are the typed schema's wire spelling.
-        let typed: localx_llama_core::tuner::Overrides = match serde_json::from_value(
-            serde_json::Value::Object(overrides.clone().into_iter().collect()),
-        ) {
-            Ok(typed) => typed,
-            Err(error) => {
-                return launch_failed(TrialFailureReason::InvalidOverrides, error.to_string())
-            }
+        let params = match candidate_launch_params(self.launcher, target, overrides) {
+            Ok(params) => params,
+            Err(error) => return launch_failed(TrialFailureReason::InvalidOverrides, error),
         };
-        let mut params = trial_launch_params(typed.to_launch_params(), &target.settings_params);
-        // Spell memory-mapping flags the way the build under test accepts them.
-        params.load_flags = self.launcher.server_capabilities(target.mode).load_flags();
         let port = match self.launcher.free_port(target.port_start) {
             Ok(port) => port,
             Err(error) => {

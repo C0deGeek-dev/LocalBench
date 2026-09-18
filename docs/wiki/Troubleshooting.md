@@ -25,7 +25,10 @@ tuning.
 
 Trial lines use stable `stage/reason` labels. `readiness/readiness_exited_oom`
 means the engine supplied real memory-fit evidence, so lowering context, using a
-smaller quant, or increasing CPU offload can help. `response/http_status`,
+smaller quant, or increasing CPU offload can help. With the memory-fit oracle a
+run normally shows at most one such line — the probe just past the fitted edge;
+an `oracle miss:` line means the fitter's own placement did not start, and the
+tuner backed off from it. `response/http_status`,
 `response/missing_timings`, `content/empty_content`, and similar labels mean the
 server started but did not produce a usable chat measurement; those failures do
 not enter the VRAM-fit ladder and are never scored or cached as successes.

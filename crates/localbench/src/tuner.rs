@@ -7,6 +7,7 @@
 //! only) → KV types → MoE refinement → verification. Every phase spends from
 //! one trial budget and dedups by config signature.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use localbench_scoring::score::Optimize;
@@ -25,6 +26,7 @@ use localbench_search::space::{
     resolve_allowed_kv_types, resolve_tuner_budget, seed_failed, swa_flag_overlays, KvPair,
     SearchSpace,
 };
+use localx_llama_core::fit::FitPlacement;
 use serde_json::json;
 
 use crate::trial::TrialRunner;
@@ -43,6 +45,10 @@ pub struct TunerParams {
     pub logical_cores: u32,
     /// Candidates retained and expanded between search phases.
     pub beam_width: usize,
+    /// Try n-gram speculative decoding (drafts from the context itself, no
+    /// draft model). Off for a model whose catalog already sets a
+    /// speculative type or draft model.
+    pub spec_ngram: bool,
 }
 
 /// The finished run.
@@ -60,6 +66,61 @@ pub struct TunerOutcome {
 /// Default number of candidate lineages retained between phases.
 pub const DEFAULT_BEAM_WIDTH: usize = 3;
 
+/// Where a candidate fits in device memory, answered by llama.cpp's own
+/// memory fitter without starting a server.
+///
+/// The answer depends on the candidate's memory shape (context, KV types,
+/// batch sizes, flash attention, load mode) and never on its placement
+/// (`NCpuMoe` / `NGpuLayers`), which is what it decides.
+pub trait FitOracle {
+    /// The fitted placement for `overrides`, or `None` when the fitter could
+    /// not answer.
+    fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement>;
+
+    /// Why llama.cpp cannot create this configuration at all, when the fitter
+    /// ran and said so (for example a quantized V cache without flash
+    /// attention). `None` when it fits or the fitter did not answer.
+    fn rejection(&mut self, _overrides: &Overrides) -> Option<String> {
+        None
+    }
+}
+
+/// Orders a phase's candidates by `llama-bench` throughput so only the most
+/// promising get a server measurement. A screen result is never a
+/// measurement: it is not scored, cached, ranked against trials, or saved.
+pub trait BenchScreen {
+    /// Candidate indices, most promising first, or `None` when `llama-bench`
+    /// could not answer (the phase then measures every candidate).
+    fn rank(&mut self, candidates: &[Overrides]) -> Option<Vec<usize>>;
+}
+
+/// The optional helpers that bound the search. With neither, the search is
+/// the trial-only one.
+#[derive(Default)]
+pub struct TunerAids<'a> {
+    /// llama.cpp's memory fitter: where a candidate fits.
+    pub oracle: Option<&'a mut dyn FitOracle>,
+    /// `llama-bench`: which candidates of a phase are worth measuring.
+    pub screen: Option<&'a mut dyn BenchScreen>,
+}
+
+/// Candidates per parent a screened phase still measures on the server: the
+/// screen's best and runner-up, so a screen misjudgement costs one rank.
+const SCREEN_KEEP: usize = 2;
+
+/// How many placement steps past the oracle's edge the VRAM-fit phase probes.
+/// The fitter keeps a free-memory margin, so one or two more layers of
+/// experts on the GPU often still start; the first failure ends the probe.
+const ORACLE_PROBE_STEPS: i64 = 2;
+
+/// How far the VRAM-fit phase backs off when the oracle's own placement runs
+/// out of memory (the oracle missed): one step at a time, this many at most.
+const ORACLE_RECOVERY_STEPS: i64 = 3;
+
+/// The refine grid around a retained `NCpuMoe` when the oracle bounded the
+/// search: the edge is already known, so only its neighbours are worth a trial.
+const ORACLE_REFINE_RADIUS: i64 = 2;
+
 /// Failed fresh verification can discard a winner and try the next beam
 /// candidate; reserve the complete retry ladder before spending on search.
 const MAX_VERIFICATION_ATTEMPTS: i64 = 3;
@@ -67,7 +128,7 @@ const MAX_VERIFICATION_ATTEMPTS: i64 = 3;
 /// The search phases in the order `run_tuner` runs them, so a phase can leave
 /// room for the ones that come after it. `verify` is not here: it spends from
 /// the reserve this list is subtracted from.
-const SEARCH_PHASES: [&str; 10] = [
+const SEARCH_PHASES: [&str; 11] = [
     "baseline",
     "kv-recovery",
     "vram-fit",
@@ -77,8 +138,14 @@ const SEARCH_PHASES: [&str; 10] = [
     "cache-flags",
     "threads",
     "kv-types",
+    "spec-ngram",
     "refine",
 ];
+
+/// The n-gram speculative type the tuner tries: a shared hash pool of the
+/// context's n-grams, cheap to keep and strongest on repetitive text such as
+/// code being edited.
+const NGRAM_SPEC_TYPE: &str = "ngram-mod";
 
 /// Trials the KV-type recovery may spend. The recovery exists to prove a
 /// working KV pair exists, not to search for the best one — the `kv-types`
@@ -202,6 +269,65 @@ fn memory_flag_overlays(
     overlays
 }
 
+/// One progress line describing the oracle's placement.
+fn oracle_note(fit: &FitPlacement, is_moe: bool) -> String {
+    let device = fit
+        .devices
+        .first()
+        .map(|d| {
+            format!(
+                " ({} MiB used, {} MiB free on {})",
+                d.used_mib, d.free_mib, d.name
+            )
+        })
+        .unwrap_or_default();
+    if is_moe {
+        format!("oracle: fits with NCpuMoe={}{device}", fit.n_cpu_moe())
+    } else if fit.gpu_layers < 0 {
+        format!("oracle: every layer fits on the GPU{device}")
+    } else {
+        format!("oracle: fits with NGpuLayers={}{device}", fit.gpu_layers)
+    }
+}
+
+/// The candidate with its placement moved to what its memory shape needs
+/// (per the oracle, corrected by the slack this host showed), when it asked
+/// for less. `None` when it already fits or the oracle cannot answer.
+fn refit_for_shape(
+    oracle: &mut dyn FitOracle,
+    overrides: &Overrides,
+    is_moe: bool,
+    slack: i64,
+) -> Option<(Overrides, String)> {
+    let fit = oracle.placement(overrides)?;
+    let current = |key: &str| overrides.get(key).and_then(serde_json::Value::as_i64);
+    if is_moe {
+        let floor = (fit.n_cpu_moe() - slack).max(0);
+        let asked = current("NCpuMoe").unwrap_or(0);
+        (asked < floor).then(|| {
+            (
+                join_overrides(overrides, &overrides_of(&[("NCpuMoe", json!(floor))])),
+                format!("NCpuMoe {asked} -> {floor}: this memory shape needs more of the model on the CPU"),
+            )
+        })
+    } else {
+        if fit.gpu_layers < 0 {
+            return None;
+        }
+        let cap = (fit.gpu_layers + slack).max(1);
+        let asked = current("NGpuLayers");
+        asked.map_or(true, |layers| layers > cap).then(|| {
+            (
+                join_overrides(overrides, &overrides_of(&[("NGpuLayers", json!(cap))])),
+                format!(
+                    "NGpuLayers {} -> {cap}: this memory shape does not fit every layer",
+                    asked.map_or_else(|| "all".to_string(), |l| l.to_string())
+                ),
+            )
+        })
+    }
+}
+
 /// Drive the full findbest search. `events` receives one plain progress line
 /// per phase and per trial.
 pub fn run_tuner(
@@ -212,6 +338,79 @@ pub fn run_tuner(
     params: &TunerParams,
     events: &mut dyn FnMut(String),
 ) -> Option<TunerOutcome> {
+    run_tuner_with(
+        runner,
+        space,
+        seeds,
+        ctx,
+        params,
+        TunerAids::default(),
+        events,
+    )
+}
+
+/// [`run_tuner`] with llama.cpp's memory fitter and `llama-bench` bounding
+/// the search.
+///
+/// The screen (`llama-bench`) orders the batching, flash-attention, threads,
+/// and KV-type candidates in one process per parent, and only the top
+/// [`SCREEN_KEEP`] of each go to a server measurement; memory and cache flags
+/// keep server-only semantics and are measured as before.
+///
+/// With an oracle, the baseline starts at the fitted placement instead of the
+/// catalog default; the VRAM-fit phase probes at most [`ORACLE_PROBE_STEPS`]
+/// past it (and backs off at most [`ORACLE_RECOVERY_STEPS`] when the fitted
+/// placement itself runs out of memory) instead of finding the edge by
+/// provoking OOMs; later phases that change the memory shape get their
+/// placement raised to what that shape needs; and the refine grid shrinks to
+/// the edge's neighbours. The oracle never produces a result: every number
+/// still comes from a real server measurement. Without one, the search is
+/// unchanged.
+pub fn run_tuner_with(
+    runner: &mut dyn TrialRunner,
+    space: &SearchSpace,
+    seeds: &SmartSeeds,
+    ctx: &ScoringContext,
+    params: &TunerParams,
+    aids: TunerAids<'_>,
+    events: &mut dyn FnMut(String),
+) -> Option<TunerOutcome> {
+    let TunerAids {
+        mut oracle,
+        mut screen,
+    } = aids;
+    let mut screened = |phase: &str,
+                        candidates: Vec<Overrides>,
+                        keep: usize,
+                        events: &mut dyn FnMut(String)|
+     -> Vec<Overrides> {
+        if candidates.len() <= keep {
+            return candidates;
+        }
+        let Some(screen) = screen.as_deref_mut() else {
+            return candidates;
+        };
+        match screen.rank(&candidates) {
+            Some(order) => {
+                events(format!(
+                    "screen [{phase}]: llama-bench ranked {} candidates; measuring the top {keep}",
+                    candidates.len()
+                ));
+                order
+                    .into_iter()
+                    .take(keep)
+                    .filter_map(|index| candidates.get(index).cloned())
+                    .collect()
+            }
+            None => {
+                events(format!(
+                    "screen [{phase}]: llama-bench gave no answer; measuring all {}",
+                    candidates.len()
+                ));
+                candidates
+            }
+        }
+    };
     let budget = resolve_tuner_budget(params.budget);
     let search_budget = budget.saturating_sub(MAX_VERIFICATION_ATTEMPTS).max(1);
     let beam_width = params.beam_width.max(1);
@@ -220,6 +419,40 @@ pub fn run_tuner(
     let mut history: Vec<Candidate> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut phase_gate: Option<PhaseGate> = None;
+
+    // ----- Phase 1 setup: the baseline, placed by the oracle when there is one -----
+    let mut baseline = overrides_of(&[
+        ("KvK", json!(params.baseline_kv.k.clone())),
+        ("KvV", json!(params.baseline_kv.v.clone())),
+    ]);
+    let fitted = oracle.as_deref_mut().and_then(|o| o.placement(&baseline));
+    if let Some(fit) = &fitted {
+        events(oracle_note(fit, space.is_moe));
+    } else if oracle.is_some() {
+        events(
+            "oracle: llama-fit-params gave no answer; searching the placement by trial".to_string(),
+        );
+    }
+    // The oracle's edge for the baseline shape: `NCpuMoe` for a MoE model,
+    // `NGpuLayers` (-1 = every layer) for a dense one.
+    let oracle_edge: Option<i64> = fitted.as_ref().map(|fit| {
+        if space.is_moe {
+            fit.n_cpu_moe()
+        } else {
+            fit.gpu_layers
+        }
+    });
+    if space.is_moe {
+        let n_cpu_moe = oracle_edge.unwrap_or(space.baseline_n_cpu_moe);
+        baseline = join_overrides(&baseline, &overrides_of(&[("NCpuMoe", json!(n_cpu_moe))]));
+    } else if let Some(layers) = oracle_edge.filter(|layers| *layers >= 0) {
+        baseline = join_overrides(&baseline, &overrides_of(&[("NGpuLayers", json!(layers))]));
+    }
+    // How far below (positive) or above (negative) the oracle's edge this
+    // host actually runs, learned in the VRAM-fit phase and applied to every
+    // later memory shape.
+    let slack = Cell::new(0_i64);
+    let oracle_active = oracle_edge.is_some();
 
     let mut measure = |overrides: &Overrides,
                        phase: &str,
@@ -257,6 +490,38 @@ pub fn run_tuner(
             }
             return None;
         }
+        // A configuration llama.cpp cannot even create is not worth a trial.
+        if oracle_active && !matches!(phase, "baseline" | "vram-fit") {
+            if let Some(reason) = oracle.as_deref_mut().and_then(|o| o.rejection(overrides)) {
+                if seen.insert(format!(
+                    "{phase}|rejected|{}",
+                    candidate_signature(overrides)
+                )) {
+                    events(format!(
+                        "oracle [{phase}]: skipped {} — llama.cpp cannot create it: {reason}",
+                        candidate_signature(overrides)
+                    ));
+                }
+                return None;
+            }
+        }
+        // A phase that changes the memory shape (KV type, batch, flags) keeps
+        // its intent but gets the placement that shape needs, instead of an
+        // OOM trial that only proves the old placement no longer fits.
+        let refitted = if oracle_active && !matches!(phase, "baseline" | "vram-fit") {
+            oracle
+                .as_deref_mut()
+                .and_then(|o| refit_for_shape(o, overrides, space.is_moe, slack.get()))
+        } else {
+            None
+        };
+        let overrides = match &refitted {
+            Some((adjusted, note)) => {
+                events(format!("oracle [{phase}]: {note}"));
+                adjusted
+            }
+            None => overrides,
+        };
         let signature = candidate_signature(overrides);
         if !seen.insert(format!("{phase}|{signature}")) {
             return None;
@@ -282,16 +547,6 @@ pub fn run_tuner(
 
     // ----- Phase 1: baseline -----
     events("phase: baseline".to_string());
-    let mut baseline = overrides_of(&[
-        ("KvK", json!(params.baseline_kv.k.clone())),
-        ("KvV", json!(params.baseline_kv.v.clone())),
-    ]);
-    if space.is_moe {
-        baseline = join_overrides(
-            &baseline,
-            &overrides_of(&[("NCpuMoe", json!(space.baseline_n_cpu_moe))]),
-        );
-    }
     let baseline_candidate = measure(
         &baseline,
         "baseline",
@@ -389,7 +644,69 @@ pub fn run_tuner(
 
     // ----- Phase 2: VRAM fit -----
     events("phase: vram-fit".to_string());
-    if space.is_moe {
+    if let Some(edge) = oracle_edge {
+        let usable = |candidate: &Option<Candidate>| {
+            candidate
+                .as_ref()
+                .and_then(|c| c.trial.as_ref())
+                .is_some_and(Trial::is_measurement_usable)
+        };
+        // A MoE model gets faster as experts move to the GPU (NCpuMoe down);
+        // a dense one as layers do (NGpuLayers up).
+        let (key, toward_gpu, lower, upper) = if space.is_moe {
+            ("NCpuMoe", -1_i64, 0_i64, space.moe_upper)
+        } else {
+            ("NGpuLayers", 1_i64, 1_i64, space.block_count.max(1) + 1)
+        };
+        if space.is_moe || edge >= 0 {
+            if baseline_usable {
+                for step in 1..=ORACLE_PROBE_STEPS {
+                    let value = edge + toward_gpu * step;
+                    if value < lower || value > upper {
+                        break;
+                    }
+                    let probe = join_overrides(&baseline, &overrides_of(&[(key, json!(value))]));
+                    if !usable(&measure(
+                        &probe,
+                        "vram-fit",
+                        &mut trials,
+                        &mut history,
+                        &mut seen,
+                        events,
+                    )) {
+                        break;
+                    }
+                    slack.set(step);
+                }
+                events(format!(
+                    "oracle: this host runs {} step(s) past the fitted {key}={edge}",
+                    slack.get()
+                ));
+            } else if baseline_needs_recovery {
+                events(format!(
+                    "oracle miss: {key}={edge} did not start; backing off one step at a time"
+                ));
+                for step in 1..=ORACLE_RECOVERY_STEPS {
+                    let value = edge - toward_gpu * step;
+                    if value < lower || value > upper {
+                        break;
+                    }
+                    let backoff = join_overrides(&baseline, &overrides_of(&[(key, json!(value))]));
+                    if usable(&measure(
+                        &backoff,
+                        "vram-fit",
+                        &mut trials,
+                        &mut history,
+                        &mut seen,
+                        events,
+                    )) {
+                        slack.set(-step);
+                        break;
+                    }
+                }
+            }
+        }
+    } else if space.is_moe {
         // The MoE sweep has no floor: the only mode that ever imposed one was
         // mtpturbo, whose draft head competed with the main model for VRAM.
         let minimum = 0;
@@ -480,28 +797,43 @@ pub fn run_tuner(
 
     // ----- Phase 3: batching (ub, b) joint sweep, b >= ub, OOM-dominance pruned -----
     events("phase: batching".to_string());
+    let batch_of = |overrides: &Overrides| {
+        let read = |key: &str| {
+            overrides
+                .get(key)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
+        (read("UbatchSize"), read("BatchSize"))
+    };
     for parent in beam_so_far(&history) {
-        let mut oomed_batching: Vec<(i64, i64)> = Vec::new();
+        let mut grid = Vec::new();
         for &ub in &space.ubatch_candidates {
             for &b in &space.batch_candidates {
-                if b < ub || batching_dominated(ub, b, &oomed_batching) {
-                    continue;
+                if b >= ub {
+                    grid.push(join_overrides(
+                        &parent.overrides,
+                        &overrides_of(&[("UbatchSize", json!(ub)), ("BatchSize", json!(b))]),
+                    ));
                 }
-                let overrides = join_overrides(
-                    &parent.overrides,
-                    &overrides_of(&[("UbatchSize", json!(ub)), ("BatchSize", json!(b))]),
-                );
-                if let Some(candidate) = measure(
-                    &overrides,
-                    "batching",
-                    &mut trials,
-                    &mut history,
-                    &mut seen,
-                    events,
-                ) {
-                    if candidate.trial.as_ref().is_some_and(|t| t.oom) {
-                        oomed_batching.push((ub, b));
-                    }
+            }
+        }
+        let mut oomed_batching: Vec<(i64, i64)> = Vec::new();
+        for overrides in screened("batching", grid, SCREEN_KEEP, events) {
+            let (ub, b) = batch_of(&overrides);
+            if batching_dominated(ub, b, &oomed_batching) {
+                continue;
+            }
+            if let Some(candidate) = measure(
+                &overrides,
+                "batching",
+                &mut trials,
+                &mut history,
+                &mut seen,
+                events,
+            ) {
+                if candidate.trial.as_ref().is_some_and(|t| t.oom) {
+                    oomed_batching.push((ub, b));
                 }
             }
         }
@@ -531,7 +863,12 @@ pub fn run_tuner(
             continue;
         }
         let beam = beam_so_far(&history);
-        for overrides in expand_phase_candidates(&beam, &overlays) {
+        let mut candidates = expand_phase_candidates(&beam, &overlays);
+        if phase == "flash-attn" {
+            // Flash attention is a two-way choice: keep the screen's pick per parent.
+            candidates = screened(phase, candidates, beam.len().max(1), events);
+        }
+        for overrides in candidates {
             measure(
                 &overrides,
                 phase,
@@ -553,11 +890,17 @@ pub fn run_tuner(
             .unwrap_or(0)
             > 0;
         if cpu_offload {
-            for &threads in &seeds.thread_candidates {
-                let overrides = join_overrides(
-                    &parent.overrides,
-                    &overrides_of(&[("Threads", json!(threads))]),
-                );
+            let candidates: Vec<Overrides> = seeds
+                .thread_candidates
+                .iter()
+                .map(|threads| {
+                    join_overrides(
+                        &parent.overrides,
+                        &overrides_of(&[("Threads", json!(threads))]),
+                    )
+                })
+                .collect();
+            for overrides in screened("threads", candidates, SCREEN_KEEP, events) {
                 measure(
                     &overrides,
                     "threads",
@@ -574,14 +917,38 @@ pub fn run_tuner(
     events("phase: kv-types".to_string());
     for parent in beam_so_far(&history) {
         let allowed = resolve_allowed_kv_types(&[], &effective_kv, space_mode(params.mode));
-        for pair in kv_candidate_pairs(&allowed, false, false) {
-            let overrides = join_overrides(
-                &parent.overrides,
-                &overrides_of(&[("KvK", json!(pair.k)), ("KvV", json!(pair.v))]),
-            );
+        let candidates: Vec<Overrides> = kv_candidate_pairs(&allowed, false, false)
+            .into_iter()
+            .map(|pair| {
+                join_overrides(
+                    &parent.overrides,
+                    &overrides_of(&[("KvK", json!(pair.k)), ("KvV", json!(pair.v))]),
+                )
+            })
+            .collect();
+        for overrides in screened("kv-types", candidates, SCREEN_KEEP, events) {
             measure(
                 &overrides,
                 "kv-types",
+                &mut trials,
+                &mut history,
+                &mut seen,
+                events,
+            );
+        }
+    }
+
+    // ----- Phase 8b: n-gram speculative decoding -----
+    // Drafting from the context's own n-grams needs no draft model, so any
+    // model can try it; it is kept only if the measured score wins.
+    if params.spec_ngram {
+        events("phase: spec-ngram".to_string());
+        let beam = beam_so_far(&history);
+        let overlay = [overrides_of(&[("SpecType", json!(NGRAM_SPEC_TYPE))])];
+        for overrides in expand_phase_candidates(&beam, &overlay) {
+            measure(
+                &overrides,
+                "spec-ngram",
                 &mut trials,
                 &mut history,
                 &mut seen,
@@ -615,11 +982,15 @@ pub fn run_tuner(
                 .and_then(serde_json::Value::as_i64)
             {
                 let mut values = fine_tune_n_cpu_moe_candidates(current, space.moe_upper);
-                for value in
-                    moe_edge_refine_values(&measured_stable, current, 5, 8, 0, space.moe_upper)
-                {
-                    if !values.contains(&value) {
-                        values.push(value);
+                if oracle_active {
+                    values.retain(|value| (value - current).abs() <= ORACLE_REFINE_RADIUS);
+                } else {
+                    for value in
+                        moe_edge_refine_values(&measured_stable, current, 5, 8, 0, space.moe_upper)
+                    {
+                        if !values.contains(&value) {
+                            values.push(value);
+                        }
                     }
                 }
                 for value in values {
@@ -833,6 +1204,7 @@ mod tests {
             mode: localx_llama_core::Mode::Native,
             logical_cores: 16,
             beam_width: DEFAULT_BEAM_WIDTH,
+            spec_ngram: false,
         }
     }
 
@@ -1801,5 +2173,465 @@ mod tests {
             no_mmap: false,
         })
         .is_empty());
+    }
+
+    /// A host whose real VRAM edge depends on the KV type: MoE configs need at
+    /// least `edge(kv)` expert blocks on the CPU and OOM below it; a dense
+    /// model OOMs above `dense_max` GPU layers. Faster with more on the GPU.
+    struct VramRunner {
+        moe_edge_q8: i64,
+        dense_max: i64,
+        measured: Vec<(String, Overrides, bool)>,
+    }
+
+    fn kv_extra(overrides: &Overrides) -> i64 {
+        match overrides.get("KvK").and_then(serde_json::Value::as_str) {
+            Some("f16") => 3,
+            _ => 0,
+        }
+    }
+
+    impl TrialRunner for VramRunner {
+        fn measure(&mut self, overrides: &Overrides, phase: &str) -> Trial {
+            let get = |key: &str| overrides.get(key).and_then(serde_json::Value::as_i64);
+            let (fits, speed) = match get("NGpuLayers") {
+                Some(layers) => (layers <= self.dense_max, layers as f64),
+                None => match get("NCpuMoe") {
+                    Some(moe) => (
+                        moe >= self.moe_edge_q8 + kv_extra(overrides),
+                        60.0 - moe as f64,
+                    ),
+                    None => (self.dense_max >= 65, 65.0),
+                },
+            };
+            self.measured
+                .push((phase.to_string(), overrides.clone(), fits));
+            if !fits {
+                return failed_trial(true);
+            }
+            Trial {
+                startup_ok: true,
+                oom: false,
+                measurement_usable: true,
+                pp_tps: 500.0 + speed,
+                tg_tps: 20.0 + speed,
+                variance: Some(0.01),
+                telemetry: Telemetry::default(),
+                ..Trial::default()
+            }
+        }
+    }
+
+    /// An oracle that answers `offset` blocks off the real edge (positive =
+    /// conservative, as llama-fit-params is with its free-memory margin).
+    struct ScriptedOracle {
+        moe_edge_q8: i64,
+        offset: i64,
+        dense_layers: Option<i64>,
+        calls: usize,
+    }
+
+    impl FitOracle for ScriptedOracle {
+        fn rejection(&mut self, overrides: &Overrides) -> Option<String> {
+            let fa_off = overrides.get("FlashAttn") == Some(&json!(false));
+            let quantized_v = overrides
+                .get("KvV")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|v| v != "f16");
+            (fa_off && quantized_v).then(|| "V cache quantization requires flash_attn".to_string())
+        }
+
+        fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement> {
+            self.calls += 1;
+            let moe = self.moe_edge_q8 + kv_extra(overrides) + self.offset;
+            Some(FitPlacement {
+                context: Some(262_144),
+                gpu_layers: self.dense_layers.unwrap_or(49),
+                cpu_expert_blocks: if self.dense_layers.is_some() {
+                    Vec::new()
+                } else {
+                    (0..u32::try_from(moe).unwrap()).collect()
+                },
+                tensor_overrides: None,
+                devices: Vec::new(),
+            })
+        }
+    }
+
+    fn ooms(runner: &VramRunner) -> Vec<String> {
+        runner
+            .measured
+            .iter()
+            .filter(|(_, _, fits)| !fits)
+            .map(|(phase, overrides, _)| format!("{phase}:{}", candidate_signature(overrides)))
+            .collect()
+    }
+
+    #[test]
+    fn a_conservative_oracle_finds_the_edge_with_one_failed_probe() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: 1,
+            dense_layers: None,
+            calls: 0,
+        };
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a winner");
+        // The baseline starts at the oracle's placement, not the catalog's 20.
+        let (phase, first, _) = &runner.measured[0];
+        assert_eq!(phase, "baseline");
+        assert_eq!(first.get("NCpuMoe"), Some(&json!(31)));
+        // One step past the edge ran, the second failed — the only OOM in the
+        // whole run: refine candidates below the proven edge are refitted.
+        assert_eq!(ooms(&runner), vec!["vram-fit:KvK=q8_0;KvV=q8_0;NCpuMoe=29"]);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("runs 1 step(s) past the fitted NCpuMoe=31")));
+        // FlashAttn=false with a q8_0 V cache cannot be created: skipped, not run.
+        assert!(lines.iter().any(
+            |l| l.starts_with("oracle [flash-attn]: skipped") && l.contains("FlashAttn=false")
+        ));
+        assert!(!runner
+            .measured
+            .iter()
+            .any(|(_, o, _)| o.get("FlashAttn") == Some(&json!(false))));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("oracle [refine]: NCpuMoe 29 -> 30")),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            outcome.winner.overrides.get("NCpuMoe"),
+            Some(&json!(30)),
+            "the fastest placement that starts"
+        );
+        let vram_fit = runner
+            .measured
+            .iter()
+            .filter(|(p, _, _)| p == "vram-fit")
+            .count();
+        assert_eq!(vram_fit, 2, "no ladder: two probes past the edge");
+        assert!(oracle.calls >= 1);
+    }
+
+    #[test]
+    fn an_optimistic_oracle_backs_off_one_step_at_a_time() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: -2,
+            dense_layers: None,
+            calls: 0,
+        };
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("recovered");
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("oracle miss: NCpuMoe=28")));
+        // Baseline 28 and back-off 29 fail; 30 starts. Later shapes inherit the
+        // correction, so nothing after the VRAM-fit phase runs out of memory.
+        assert_eq!(
+            ooms(&runner),
+            vec![
+                "baseline:KvK=q8_0;KvV=q8_0;NCpuMoe=28",
+                "vram-fit:KvK=q8_0;KvV=q8_0;NCpuMoe=29",
+            ]
+        );
+        assert_eq!(outcome.winner.overrides.get("NCpuMoe"), Some(&json!(30)));
+    }
+
+    #[test]
+    fn a_dense_model_starts_at_the_fitted_layer_count_and_probes_upward() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 0,
+            dense_max: 41,
+            measured: Vec::new(),
+        };
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 0,
+            offset: 0,
+            dense_layers: Some(40),
+            calls: 0,
+        };
+        let outcome = run_tuner_with(
+            &mut runner,
+            &dense_space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |_| {},
+        )
+        .expect("a winner");
+        assert_eq!(runner.measured[0].1.get("NGpuLayers"), Some(&json!(40)));
+        assert_eq!(
+            ooms(&runner),
+            vec!["vram-fit:KvK=q8_0;KvV=q8_0;NGpuLayers=42"]
+        );
+        assert_eq!(outcome.winner.overrides.get("NGpuLayers"), Some(&json!(41)));
+    }
+
+    #[test]
+    fn an_oracle_without_an_answer_leaves_the_trial_search_in_charge() {
+        struct Silent;
+        impl FitOracle for Silent {
+            fn placement(&mut self, _overrides: &Overrides) -> Option<FitPlacement> {
+                None
+            }
+        }
+        let mut with = ScriptedRunner {
+            measured: Vec::new(),
+        };
+        let mut without = ScriptedRunner {
+            measured: Vec::new(),
+        };
+        let mut silent = Silent;
+        let a = run_tuner_with(
+            &mut with,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut silent),
+                screen: None,
+            },
+            &mut |_| {},
+        );
+        let b = run_tuner(
+            &mut without,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            &mut |_| {},
+        );
+        assert_eq!(with.measured, without.measured);
+        assert_eq!(
+            a.map(|o| candidate_signature(&o.winner.overrides)),
+            b.map(|o| candidate_signature(&o.winner.overrides))
+        );
+    }
+
+    #[test]
+    fn a_heavier_memory_shape_is_refitted_not_crashed() {
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: 1,
+            dense_layers: None,
+            calls: 0,
+        };
+        // Proven slack 1: this host runs one block past the fitted edge.
+        let f16 = overrides_of(&[
+            ("KvK", json!("f16")),
+            ("KvV", json!("f16")),
+            ("NCpuMoe", json!(30)),
+        ]);
+        let (adjusted, note) = refit_for_shape(&mut oracle, &f16, true, 1).unwrap();
+        assert_eq!(adjusted.get("NCpuMoe"), Some(&json!(33)));
+        assert!(note.starts_with("NCpuMoe 30 -> 33"), "{note}");
+        let q8 = overrides_of(&[("KvK", json!("q8_0")), ("NCpuMoe", json!(30))]);
+        assert!(refit_for_shape(&mut oracle, &q8, true, 1).is_none());
+        let dense = ScriptedOracle {
+            moe_edge_q8: 0,
+            offset: 0,
+            dense_layers: Some(40),
+            calls: 0,
+        };
+        let mut dense = dense;
+        let all_layers = overrides_of(&[("KvK", json!("q8_0"))]);
+        let (capped, _) = refit_for_shape(&mut dense, &all_layers, false, 1).unwrap();
+        assert_eq!(capped.get("NGpuLayers"), Some(&json!(41)));
+    }
+
+    /// Ranks batching candidates by ubatch size, largest first; answers
+    /// nothing when `silent`.
+    struct UbatchScreen {
+        silent: bool,
+        calls: usize,
+    }
+
+    impl BenchScreen for UbatchScreen {
+        fn rank(&mut self, candidates: &[Overrides]) -> Option<Vec<usize>> {
+            self.calls += 1;
+            if self.silent {
+                return None;
+            }
+            let mut order: Vec<usize> = (0..candidates.len()).collect();
+            let ub = |i: &usize| {
+                candidates[*i]
+                    .get("UbatchSize")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0)
+            };
+            order.sort_by_key(|i| std::cmp::Reverse(ub(i)));
+            Some(order)
+        }
+    }
+
+    fn batching_trials(runner: &ScriptedRunner) -> usize {
+        runner.measured.iter().filter(|p| *p == "batching").count()
+    }
+
+    #[test]
+    fn a_screened_phase_measures_only_the_top_candidates_per_parent() {
+        let mut screened = ScriptedRunner {
+            measured: Vec::new(),
+        };
+        let mut screen = UbatchScreen {
+            silent: false,
+            calls: 0,
+        };
+        let mut lines = Vec::new();
+        run_tuner_with(
+            &mut screened,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: None,
+                screen: Some(&mut screen),
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a winner");
+        assert!(screen.calls > 0);
+        let batching = batching_trials(&screened);
+        assert!((1..=SCREEN_KEEP * DEFAULT_BEAM_WIDTH).contains(&batching));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("screen [batching]: llama-bench ranked")));
+        let largest = space().ubatch_candidates.iter().copied().max().unwrap();
+        let first = lines
+            .iter()
+            .find(|l| l.contains("[batching]") && l.starts_with("trial "))
+            .unwrap();
+        assert!(
+            first.contains(&format!("UbatchSize={largest}")),
+            "the screen's top pick is measured first: {first}"
+        );
+    }
+
+    #[test]
+    fn a_screen_without_an_answer_measures_every_candidate() {
+        let mut plain = ScriptedRunner {
+            measured: Vec::new(),
+        };
+        run_tuner(
+            &mut plain,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            &mut |_| {},
+        );
+        let mut fallback = ScriptedRunner {
+            measured: Vec::new(),
+        };
+        let mut screen = UbatchScreen {
+            silent: true,
+            calls: 0,
+        };
+        run_tuner_with(
+            &mut fallback,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: None,
+                screen: Some(&mut screen),
+            },
+            &mut |_| {},
+        );
+        assert_eq!(fallback.measured, plain.measured);
+    }
+
+    #[test]
+    fn ngram_speculation_is_measured_when_enabled_and_kept_only_if_it_wins() {
+        struct SpecRunner {
+            measured: Vec<(String, Overrides)>,
+            boost: f64,
+        }
+        impl TrialRunner for SpecRunner {
+            fn measure(&mut self, overrides: &Overrides, phase: &str) -> Trial {
+                self.measured.push((phase.to_string(), overrides.clone()));
+                let spec = overrides.get("SpecType").is_some();
+                Trial {
+                    startup_ok: true,
+                    measurement_usable: true,
+                    pp_tps: 500.0,
+                    tg_tps: if spec { 20.0 + self.boost } else { 20.0 },
+                    variance: Some(0.01),
+                    ..Trial::default()
+                }
+            }
+        }
+        for (boost, expect_spec) in [(8.0, true), (-8.0, false)] {
+            let mut runner = SpecRunner {
+                measured: Vec::new(),
+                boost,
+            };
+            let with = TunerParams {
+                spec_ngram: true,
+                ..params()
+            };
+            let outcome = run_tuner(&mut runner, &space(), &seeds(), &ctx(), &with, &mut |_| {})
+                .expect("a winner");
+            assert!(runner
+                .measured
+                .iter()
+                .any(|(phase, o)| phase == "spec-ngram"
+                    && o.get("SpecType") == Some(&json!("ngram-mod"))));
+            assert_eq!(
+                outcome.winner.overrides.contains_key("SpecType"),
+                expect_spec,
+                "boost {boost}"
+            );
+        }
+        let mut off = SpecRunner {
+            measured: Vec::new(),
+            boost: 8.0,
+        };
+        run_tuner(&mut off, &space(), &seeds(), &ctx(), &params(), &mut |_| {});
+        assert!(!off.measured.iter().any(|(phase, _)| phase == "spec-ngram"));
     }
 }

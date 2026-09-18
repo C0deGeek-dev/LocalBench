@@ -472,7 +472,9 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         chat_prompt_hash, chat_request_shape_hash, session_fingerprint, trial_launch_params,
         LiveRunner, TrialTarget, MEASUREMENT_PROTOCOL, RESPONSE_SCHEMA, TELEMETRY_PROTOCOL,
     };
-    use localbench::tuner::{run_tuner, TunerParams, DEFAULT_BEAM_WIDTH};
+    use localbench::tuner::{
+        run_tuner_with, BenchScreen, FitOracle, TunerAids, TunerParams, DEFAULT_BEAM_WIDTH,
+    };
     use localbench_scoring::score::{HostSignals, Optimize, Workload};
     use localbench_search::candidate::{ScoreProfile, ScoringContext};
     use localbench_search::space::{resolve_search_space, KvPair, ModelAxes};
@@ -614,27 +616,50 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         mode,
         logical_cores: cores,
         beam_width,
+        // A catalog speculative type or draft model is the model's own choice;
+        // n-gram speculation is only tried for models without one.
+        spec_ngram: def.spec_type.is_none() && def.draft_module.is_none(),
     };
     let settings_params = launcher.settings_launch_params();
     let session_defaults = trial_launch_params(Default::default(), &settings_params);
     let run_id = format!("{}-{}", now_iso(), std::process::id());
     let log_dir = local_llm.join("logs").join("tuner");
-    let mut live = LiveRunner::new(
-        &launcher,
-        TrialTarget {
-            key: key.clone(),
-            def: def.clone(),
-            context_key: resolved_context.clone(),
-            mode,
-            model_arg_path: gguf.to_string_lossy().to_string(),
-            runs,
-            port_start: 8091,
-            log_dir: log_dir.clone(),
-            settings_params,
-        },
-        startup_timeout_secs,
-        &run_id,
-    );
+    let target = TrialTarget {
+        key: key.clone(),
+        def: def.clone(),
+        context_key: resolved_context.clone(),
+        mode,
+        model_arg_path: gguf.to_string_lossy().to_string(),
+        runs,
+        port_start: 8091,
+        log_dir: log_dir.clone(),
+        settings_params,
+    };
+    // llama.cpp's memory fitter bounds the search unless the build lacks it
+    // or `--no-oracle` asks for the trial-only search.
+    let mut oracle = if args.iter().any(|a| a == "--no-oracle") {
+        None
+    } else {
+        localbench::oracle::LiveFitOracle::new(
+            &launcher,
+            target.clone(),
+            localbench::oracle::DEFAULT_FIT_MARGIN_MIB,
+        )
+    };
+    if oracle.is_none() {
+        eprintln!("oracle: off — the VRAM edge is found by trial");
+    }
+    // llama-bench screens the no-server axes unless `--no-screen` asks for
+    // every candidate to be measured on the server.
+    let mut bench_screen = if args.iter().any(|a| a == "--no-screen") {
+        None
+    } else {
+        localbench::screen::LiveBenchScreen::new(&launcher, target.clone(), optimize)
+    };
+    if bench_screen.is_none() {
+        eprintln!("screen: off — every candidate is measured on the server");
+    }
+    let mut live = LiveRunner::new(&launcher, target, startup_timeout_secs, &run_id);
 
     // The persistent trial cache: an interrupted or repeated findbest reuses
     // every decisive measurement, keyed by config signature and invalidated
@@ -736,9 +761,21 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         },
         localbench::tuner::rank_profile(profile),
     );
-    let outcome = run_tuner(&mut runner, &space, &seeds, &ctx, &params, &mut |line| {
-        eprintln!("{line}");
-    });
+    let (oracle_used, screen_used) = (oracle.is_some(), bench_screen.is_some());
+    let outcome = run_tuner_with(
+        &mut runner,
+        &space,
+        &seeds,
+        &ctx,
+        &params,
+        TunerAids {
+            oracle: oracle.as_mut().map(|o| o as &mut dyn FitOracle),
+            screen: bench_screen.as_mut().map(|s| s as &mut dyn BenchScreen),
+        },
+        &mut |line| {
+            eprintln!("{line}");
+        },
+    );
     let manifest_path = runner
         .manifest_path()
         .map(|path| path.display().to_string())
@@ -764,6 +801,13 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         "verified": outcome.verified,
         "search_strategy": "beam",
         "beam_width": outcome.beam_width,
+        // Which helpers bounded the search: llama.cpp's memory fitter placed
+        // the VRAM edge, llama-bench screened the no-server axes. Neither
+        // produced a number; every score above is a server measurement.
+        "search_aids": {
+            "fit_oracle": oracle_used,
+            "bench_screen": screen_used,
+        },
         "diagnostics": manifest_path,
         // How much of the balanced discount actually fired: "full" only when
         // host telemetry backed every factor; unavailable probes are named in
