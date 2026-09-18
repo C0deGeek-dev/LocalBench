@@ -57,7 +57,10 @@ an oracle for *where* a candidate fits, never for how fast it runs:
   catalog default;
 - **vram-fit** probes at most two steps past it — the fitter keeps about
   1 GiB free per device, so one or two more layers often still start — and
-  stops at the first failure. If the fitted placement itself runs out of
+  stops at the first failure. A step that starts but scores well below the one
+  before it counts as a failure too: on Windows the GPU driver spills
+  overcommitted VRAM into system memory instead of failing, and such a server
+  runs at a fraction of the speed. If the fitted placement itself runs out of
   memory it backs off one step at a time (at most three) and says so. The
   distance this host runs from the fitted edge carries into later phases;
 - a later phase that changes the memory shape (KV type, batch size, flash

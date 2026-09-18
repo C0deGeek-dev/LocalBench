@@ -119,6 +119,12 @@ const SCREEN_MIN_SAVED: usize = 3;
 /// experts on the GPU often still start; the first failure ends the probe.
 const ORACLE_PROBE_STEPS: i64 = 2;
 
+/// A probe step scoring below this fraction of the step before it has spilled
+/// VRAM into system memory (Windows drivers fall back instead of failing):
+/// it counts as past the edge. Measurement noise stays well above it; a spill
+/// typically loses two thirds of the throughput.
+const ORACLE_SPILL_RATIO: f64 = 0.8;
+
 /// How far the VRAM-fit phase backs off when the oracle's own placement runs
 /// out of memory (the oracle missed): one step at a time, this many at most.
 const ORACLE_RECOVERY_STEPS: i64 = 3;
@@ -686,22 +692,38 @@ pub fn run_tuner_with(
         };
         if space.is_moe || edge >= 0 {
             if baseline_usable {
+                let mut previous = baseline_candidate
+                    .as_ref()
+                    .map_or(0.0, |candidate| candidate.selected_score);
                 for step in 1..=ORACLE_PROBE_STEPS {
                     let value = edge + toward_gpu * step;
                     if value < lower || value > upper {
                         break;
                     }
                     let probe = join_overrides(&baseline, &overrides_of(&[(key, json!(value))]));
-                    if !usable(&measure(
+                    let measured = measure(
                         &probe,
                         "vram-fit",
                         &mut trials,
                         &mut history,
                         &mut seen,
                         events,
-                    )) {
+                    );
+                    if !usable(&measured) {
                         break;
                     }
+                    // More of the model on the GPU never makes a run slower —
+                    // unless VRAM is overcommitted and the driver quietly spills
+                    // to system memory, which starts but crawls. That step is
+                    // past the real edge even though it did not OOM.
+                    let score = measured.as_ref().map_or(0.0, |c| c.selected_score);
+                    if score < previous * ORACLE_SPILL_RATIO {
+                        events(format!(
+                            "oracle: {key}={value} started but scored {score:.1} against {previous:.1} one step earlier — VRAM spilled to system memory; the edge is the step before"
+                        ));
+                        break;
+                    }
+                    previous = score;
                     slack.set(step);
                 }
                 events(format!(
@@ -2720,5 +2742,71 @@ mod tests {
         }
         assert!(!lines.iter().any(|l| l.starts_with("screen [threads]")));
         assert!(!lines.iter().any(|l| l.starts_with("screen [flash-attn]")));
+    }
+
+    /// Past `edge - 1` the driver spills to system memory: the server starts
+    /// but crawls instead of running out of memory.
+    struct SpillRunner {
+        edge: i64,
+        measured: Vec<i64>,
+    }
+
+    impl TrialRunner for SpillRunner {
+        fn measure(&mut self, overrides: &Overrides, _phase: &str) -> Trial {
+            let moe = overrides
+                .get("NCpuMoe")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            self.measured.push(moe);
+            let tg = if moe >= self.edge - 1 {
+                25.0 + (self.edge - moe) as f64
+            } else {
+                8.0
+            };
+            Trial {
+                startup_ok: true,
+                measurement_usable: true,
+                pp_tps: 200.0,
+                tg_tps: tg,
+                variance: Some(0.01),
+                ..Trial::default()
+            }
+        }
+    }
+
+    #[test]
+    fn a_probe_that_starts_but_crawls_is_past_the_edge() {
+        let mut runner = SpillRunner {
+            edge: 31,
+            measured: Vec::new(),
+        };
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: 1,
+            dense_layers: None,
+            calls: 0,
+        };
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a winner");
+        assert!(
+            lines.iter().any(|l| l.contains("VRAM spilled")),
+            "{lines:#?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("runs 1 step(s) past the fitted NCpuMoe=31")));
+        assert_eq!(outcome.winner.overrides.get("NCpuMoe"), Some(&json!(30)));
     }
 }
