@@ -84,7 +84,10 @@ Four phases vary only settings `llama-bench` can sweep inside one process —
 For each beam parent, `findbest` runs the phase's candidates through one
 `llama-bench` process (2048 prompt and 128 generated tokens, two repetitions),
 ranks them by the same objective the tuner optimizes, and measures only the
-best two on the server (one per parent for flash attention). The screen is
+best two on the server. A screen loads the model once, which on a fast-loading
+model costs about two server trials, so a phase is only screened when that saves
+at least three trials (in practice batching and, on turbo builds, KV types);
+configurations the memory fitter already rejects are never handed to it. The screen is
 never a result: its numbers are not scored, cached, ranked against server
 trials, verified, or saved, and a screen that cannot answer leaves the phase
 measuring every candidate. `--no-screen` measures every candidate on the

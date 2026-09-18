@@ -108,6 +108,12 @@ pub struct TunerAids<'a> {
 /// screen's best and runner-up, so a screen misjudgement costs one rank.
 const SCREEN_KEEP: usize = 2;
 
+/// Server trials a screen must save before it is worth running. One
+/// `llama-bench` process loads the model and sweeps the grid; on a model that
+/// loads in seconds that costs about two server trials, so smaller phases are
+/// measured directly.
+const SCREEN_MIN_SAVED: usize = 3;
+
 /// How many placement steps past the oracle's edge the VRAM-fit phase probes.
 /// The fitter keeps a free-memory margin, so one or two more layers of
 /// experts on the GPU often still start; the first failure ends the probe.
@@ -379,38 +385,6 @@ pub fn run_tuner_with(
         mut oracle,
         mut screen,
     } = aids;
-    let mut screened = |phase: &str,
-                        candidates: Vec<Overrides>,
-                        keep: usize,
-                        events: &mut dyn FnMut(String)|
-     -> Vec<Overrides> {
-        if candidates.len() <= keep {
-            return candidates;
-        }
-        let Some(screen) = screen.as_deref_mut() else {
-            return candidates;
-        };
-        match screen.rank(&candidates) {
-            Some(order) => {
-                events(format!(
-                    "screen [{phase}]: llama-bench ranked {} candidates; measuring the top {keep}",
-                    candidates.len()
-                ));
-                order
-                    .into_iter()
-                    .take(keep)
-                    .filter_map(|index| candidates.get(index).cloned())
-                    .collect()
-            }
-            None => {
-                events(format!(
-                    "screen [{phase}]: llama-bench gave no answer; measuring all {}",
-                    candidates.len()
-                ));
-                candidates
-            }
-        }
-    };
     let budget = resolve_tuner_budget(params.budget);
     let search_budget = budget.saturating_sub(MAX_VERIFICATION_ATTEMPTS).max(1);
     let beam_width = params.beam_width.max(1);
@@ -454,6 +428,57 @@ pub fn run_tuner_with(
     let slack = Cell::new(0_i64);
     let oracle_active = oracle_edge.is_some();
 
+    // The oracle is shared by the measure step (placement, rejections) and the
+    // screen (which must never be handed a configuration llama.cpp rejects:
+    // one invalid variant aborts the whole llama-bench process).
+    let oracle = std::cell::RefCell::new(oracle);
+    let rejected = |overrides: &Overrides| -> Option<String> {
+        if !oracle_active {
+            return None;
+        }
+        oracle
+            .borrow_mut()
+            .as_deref_mut()
+            .and_then(|o| o.rejection(overrides))
+    };
+    let mut screened = |phase: &str,
+                        candidates: Vec<Overrides>,
+                        keep: usize,
+                        events: &mut dyn FnMut(String)|
+     -> Vec<Overrides> {
+        let Some(screen) = screen.as_deref_mut() else {
+            return candidates;
+        };
+        // Configurations llama.cpp cannot create go straight to the measure
+        // step, which skips and reports them; they are never screened.
+        let (invalid, valid): (Vec<Overrides>, Vec<Overrides>) =
+            candidates.into_iter().partition(|c| rejected(c).is_some());
+        if valid.len() < keep + SCREEN_MIN_SAVED {
+            return valid.into_iter().chain(invalid).collect();
+        }
+        match screen.rank(&valid) {
+            Some(order) => {
+                events(format!(
+                    "screen [{phase}]: llama-bench ranked {} candidates; measuring the top {keep}",
+                    valid.len()
+                ));
+                order
+                    .into_iter()
+                    .take(keep)
+                    .filter_map(|index| valid.get(index).cloned())
+                    .chain(invalid)
+                    .collect()
+            }
+            None => {
+                events(format!(
+                    "screen [{phase}]: llama-bench gave no answer; measuring all {}",
+                    valid.len()
+                ));
+                valid.into_iter().chain(invalid).collect()
+            }
+        }
+    };
+
     let mut measure = |overrides: &Overrides,
                        phase: &str,
                        trials: &mut usize,
@@ -492,7 +517,7 @@ pub fn run_tuner_with(
         }
         // A configuration llama.cpp cannot even create is not worth a trial.
         if oracle_active && !matches!(phase, "baseline" | "vram-fit") {
-            if let Some(reason) = oracle.as_deref_mut().and_then(|o| o.rejection(overrides)) {
+            if let Some(reason) = rejected(overrides) {
                 if seen.insert(format!(
                     "{phase}|rejected|{}",
                     candidate_signature(overrides)
@@ -510,6 +535,7 @@ pub fn run_tuner_with(
         // OOM trial that only proves the old placement no longer fits.
         let refitted = if oracle_active && !matches!(phase, "baseline" | "vram-fit") {
             oracle
+                .borrow_mut()
                 .as_deref_mut()
                 .and_then(|o| refit_for_shape(o, overrides, space.is_moe, slack.get()))
         } else {
@@ -2633,5 +2659,66 @@ mod tests {
         };
         run_tuner(&mut off, &space(), &seeds(), &ctx(), &params(), &mut |_| {});
         assert!(!off.measured.iter().any(|(phase, _)| phase == "spec-ngram"));
+    }
+
+    /// Records every candidate it is asked to rank; ranks in the given order.
+    struct RecordingScreen {
+        asked: Vec<Vec<Overrides>>,
+    }
+
+    impl BenchScreen for RecordingScreen {
+        fn rank(&mut self, candidates: &[Overrides]) -> Option<Vec<usize>> {
+            self.asked.push(candidates.to_vec());
+            Some((0..candidates.len()).collect())
+        }
+    }
+
+    #[test]
+    fn the_screen_never_sees_rejected_configs_and_skips_small_phases() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: 1,
+            dense_layers: None,
+            calls: 0,
+        };
+        let mut screen = RecordingScreen { asked: Vec::new() };
+        let mut lines = Vec::new();
+        run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: Some(&mut screen),
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a winner");
+        assert!(
+            !screen.asked.is_empty(),
+            "batching is large enough to screen"
+        );
+        for batch in &screen.asked {
+            assert!(
+                batch.len() >= SCREEN_KEEP + SCREEN_MIN_SAVED,
+                "{}",
+                batch.len()
+            );
+            assert!(
+                !batch
+                    .iter()
+                    .any(|o| o.get("FlashAttn") == Some(&json!(false))),
+                "a rejected config reached the screen"
+            );
+        }
+        assert!(!lines.iter().any(|l| l.starts_with("screen [threads]")));
+        assert!(!lines.iter().any(|l| l.starts_with("screen [flash-attn]")));
     }
 }
