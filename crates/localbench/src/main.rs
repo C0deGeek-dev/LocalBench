@@ -408,6 +408,17 @@ fn probe_vram_gb() -> u32 {
     }
 }
 
+/// Size of a model on disk in GiB, every shard of a split GGUF included (the
+/// first shard of a split model can hold nothing but metadata).
+fn gguf_total_size_gb(gguf: &std::path::Path) -> f64 {
+    let bytes: u64 = localx_llama_core::quant::shard_files_from_primary(&gguf.to_string_lossy())
+        .iter()
+        .filter_map(|shard| std::fs::metadata(shard).ok())
+        .map(|meta| meta.len())
+        .sum();
+    bytes as f64 / 1_073_741_824.0
+}
+
 fn probe_available_ram_gb() -> f64 {
     let mut system = sysinfo::System::new_all();
     system.refresh_memory();
@@ -721,9 +732,7 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
             vram_gb: probe_vram_gb(),
             logical_cores: cores,
             available_ram_gb: probe_available_ram_gb(),
-            gguf_size_gb: std::fs::metadata(&gguf)
-                .map(|m| m.len() as f64 / 1_073_741_824.0)
-                .unwrap_or(0.0),
+            gguf_size_gb: gguf_total_size_gb(&gguf),
         },
         localbench::tuner::rank_profile(profile),
     );
@@ -819,7 +828,9 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{iso_from_secs, parse_mode, probe_available_ram_gb, resolve_mode};
+    use super::{
+        gguf_total_size_gb, iso_from_secs, parse_mode, probe_available_ram_gb, resolve_mode,
+    };
     use localx_llama_core::Mode;
 
     #[test]
@@ -886,5 +897,22 @@ mod tests {
             available_ram_gb > 0.0,
             "the seed resolver must receive measured RAM, got {available_ram_gb}GB"
         );
+    }
+
+    #[test]
+    fn a_split_model_is_sized_by_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = |n: u32| {
+            dir.path()
+                .join(format!("Model-IQ3_XXS-0000{n}-of-00003.gguf"))
+        };
+        std::fs::write(shard(1), vec![0u8; 1024]).unwrap();
+        std::fs::write(shard(2), vec![0u8; 2048]).unwrap();
+        std::fs::write(shard(3), vec![0u8; 4096]).unwrap();
+        let expected = 7168.0 / 1_073_741_824.0;
+        assert!((gguf_total_size_gb(&shard(1)) - expected).abs() < 1e-12);
+        let single = dir.path().join("Model-Q4_K_M.gguf");
+        std::fs::write(&single, vec![0u8; 512]).unwrap();
+        assert!((gguf_total_size_gb(&single) - 512.0 / 1_073_741_824.0).abs() < 1e-12);
     }
 }

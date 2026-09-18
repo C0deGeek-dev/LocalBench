@@ -179,6 +179,29 @@ fn trial_summary(trial: &Trial, score: f64) -> String {
 /// (halving from the real layer count), on top of the KV-shrink candidates.
 const DENSE_NGL_CANDIDATES: usize = 4;
 
+/// The memory-flag candidates worth measuring on this host: loading into RAM
+/// (`NoMmap`) and locking (`Mlock`) only where the seeds say the RAM is there.
+/// The launcher spells them for the target build (`--load-mode` or the legacy
+/// flags), so these stay build-independent intents.
+fn memory_flag_overlays(
+    recommendation: localbench_search::seeds::MmapRecommendation,
+) -> Vec<Overrides> {
+    let mut overlays = Vec::new();
+    if recommendation.mlock {
+        overlays.push(overrides_of(&[("Mlock", json!(true))]));
+    }
+    if recommendation.no_mmap {
+        overlays.push(overrides_of(&[("NoMmap", json!(true))]));
+    }
+    if recommendation.mlock && recommendation.no_mmap {
+        overlays.push(overrides_of(&[
+            ("Mlock", json!(true)),
+            ("NoMmap", json!(true)),
+        ]));
+    }
+    overlays
+}
+
 /// Drive the full findbest search. `events` receives one plain progress line
 /// per phase and per trial.
 pub fn run_tuner(
@@ -495,16 +518,18 @@ pub fn run_tuner(
         ),
         (
             "memory-flags",
-            vec![
-                overrides_of(&[("Mlock", json!(true))]),
-                overrides_of(&[("NoMmap", json!(true))]),
-                overrides_of(&[("Mlock", json!(true)), ("NoMmap", json!(true))]),
-            ],
+            memory_flag_overlays(seeds.mmap_recommendation),
         ),
         ("cache-flags", swa_flag_overlays()),
     ];
     for (phase, overlays) in flag_phases {
         events(format!("phase: {phase}"));
+        if overlays.is_empty() {
+            events(format!(
+                "{phase}: skipped — not enough free RAM to load or lock this model in memory"
+            ));
+            continue;
+        }
         let beam = beam_so_far(&history);
         for overrides in expand_phase_candidates(&beam, &overlays) {
             measure(
@@ -1743,5 +1768,38 @@ mod tests {
             vram_fit, 0,
             "a dense model whose baseline starts spends no VRAM-fit trials"
         );
+    }
+
+    #[test]
+    fn memory_flags_follow_the_host_ram_recommendation() {
+        use localbench_search::seeds::MmapRecommendation;
+        let keys = |overlays: Vec<Overrides>| -> Vec<Vec<String>> {
+            overlays
+                .into_iter()
+                .map(|o| o.keys().cloned().collect())
+                .collect()
+        };
+        let all = memory_flag_overlays(MmapRecommendation {
+            mlock: true,
+            no_mmap: true,
+        });
+        assert_eq!(
+            keys(all),
+            vec![
+                vec!["Mlock".to_string()],
+                vec!["NoMmap".to_string()],
+                vec!["Mlock".to_string(), "NoMmap".to_string()],
+            ]
+        );
+        let no_lock = memory_flag_overlays(MmapRecommendation {
+            mlock: false,
+            no_mmap: true,
+        });
+        assert_eq!(keys(no_lock), vec![vec!["NoMmap".to_string()]]);
+        assert!(memory_flag_overlays(MmapRecommendation {
+            mlock: false,
+            no_mmap: false,
+        })
+        .is_empty());
     }
 }

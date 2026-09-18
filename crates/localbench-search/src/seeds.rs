@@ -112,17 +112,7 @@ pub fn resolve_smart_seeds(space: &SearchSpace, host: HostFacts, profile: Profil
         ),
     };
 
-    let mmap_recommendation = if host.available_ram_gb > 0.0 && host.available_ram_gb < 8.0 {
-        MmapRecommendation {
-            mlock: false,
-            no_mmap: false,
-        }
-    } else {
-        MmapRecommendation {
-            mlock: true,
-            no_mmap: true,
-        }
-    };
+    let mmap_recommendation = mmap_recommendation(host);
 
     let vram_risk = if host.vram_gb > 0 && host.vram_gb <= 12 {
         VramRisk::High
@@ -159,6 +149,28 @@ pub fn resolve_smart_seeds(space: &SearchSpace, host: HostFacts, profile: Profil
         assumptions,
         vram_gb: host.vram_gb,
         gguf_size_gb: host.gguf_size_gb,
+    }
+}
+
+/// RAM a host must keep free, beyond what it pins, before the tuner tries
+/// loading the model into RAM (`NoMmap`) or locking it there (`Mlock`).
+const PINNING_HEADROOM_GB: f64 = 8.0;
+
+/// Which memory-pinning candidates are worth measuring on this host.
+///
+/// Loading without mmap needs working room; locking holds the whole model in
+/// RAM, so it is only tried when the full GGUF (every shard) fits beside the
+/// headroom. Unknown RAM or size keeps the candidate: the trial itself is the
+/// evidence.
+fn mmap_recommendation(host: HostFacts) -> MmapRecommendation {
+    let ram_known = host.available_ram_gb > 0.0;
+    let no_mmap = !ram_known || host.available_ram_gb >= PINNING_HEADROOM_GB;
+    let model_fits = !ram_known
+        || host.gguf_size_gb <= 0.0
+        || host.available_ram_gb >= host.gguf_size_gb + PINNING_HEADROOM_GB;
+    MmapRecommendation {
+        mlock: no_mmap && model_fits,
+        no_mmap,
     }
 }
 
@@ -260,6 +272,35 @@ mod tests {
         assert!(balanced.thread_candidates.iter().all(|t| *t < 16));
         let pure = resolve_smart_seeds(&space, host, Profile::Pure);
         assert_eq!(pure.thread_candidates, vec![8, 12, 16]);
+    }
+
+    #[test]
+    fn a_model_larger_than_ram_is_never_locked_but_may_load_without_mmap() {
+        let space = moe_space(35);
+        let big = resolve_smart_seeds(
+            &space,
+            HostFacts {
+                available_ram_gb: 58.0,
+                gguf_size_gb: 105.6,
+                logical_cores: 32,
+                ..HostFacts::default()
+            },
+            Profile::Pure,
+        );
+        assert!(!big.mmap_recommendation.mlock);
+        assert!(big.mmap_recommendation.no_mmap);
+        let small = resolve_smart_seeds(
+            &space,
+            HostFacts {
+                available_ram_gb: 58.0,
+                gguf_size_gb: 22.8,
+                logical_cores: 32,
+                ..HostFacts::default()
+            },
+            Profile::Pure,
+        );
+        assert!(small.mmap_recommendation.mlock);
+        assert!(small.mmap_recommendation.no_mmap);
     }
 
     #[test]

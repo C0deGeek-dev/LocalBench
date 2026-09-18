@@ -95,7 +95,14 @@ so a phase measuring nothing is never silent.
    `b >= ub`, pruned by OOM dominance: a pair equal-or-larger on both axes
    than an already-OOM'd pair is never measured.
 5. **flash-attn** — flash-attention on vs off, overlaid on the current beam.
-6. **memory-flags** — `--mlock`, `--no-mmap`, and both together.
+6. **memory-flags** — locking the model in RAM (`Mlock`), loading it into RAM
+   instead of memory-mapping it (`NoMmap`), and both together — each spelled the
+   way the build under test accepts it: `--load-mode mmap+mlock` / `none` /
+   `mlock` on builds that list `--load-mode` (current mainline, prism), the
+   legacy `--mlock` / `--no-mmap` on builds that do not (turboquant). The
+   candidates follow your free RAM: loading into RAM needs working room, and
+   locking is only tried when the whole model — every shard of a split GGUF —
+   fits beside it. With too little RAM the phase is skipped and says so.
 7. **cache-flags** — default SWA/cache behaviour vs `--swa-full`,
    `--cache-prompt`, and both together with `CacheReuse=256`.
 8. **threads** — CPU thread sweep, only when the current best actually keeps
@@ -144,7 +151,8 @@ keys:
 - `UbatchSize` / `BatchSize` — llama.cpp `--ubatch-size` / `--batch-size`.
 - `Threads` / `ThreadsBatch` — llama.cpp `--threads` / `--threads-batch`.
 - `FlashAttn` — flash-attention on/off.
-- `Mlock` / `NoMmap` — llama.cpp `--mlock` / `--no-mmap`.
+- `Mlock` / `NoMmap` — lock the model in RAM / load it without mmap; see
+  **memory-flags** above for how each build spells them.
 - `KvK` / `KvV` — KV-cache types for keys/values, passed as `-ctk` / `-ctv`.
 - `SwaFull` / `CachePrompt` / `CacheReuse` — SWA and prompt-cache flags.
 

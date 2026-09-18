@@ -4,6 +4,20 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **Memory-flag trials work on the native engine and follow your RAM.** Current
+  mainline llama.cpp rejects `--no-mmap` / `--mlock` (they became
+  `--load-mode`), so every memory-flags trial on the native engine failed to
+  start and spent a trial. Trials now spell `NoMmap` / `Mlock` the way the build
+  under test accepts them, read from its own help. The phase also stopped
+  proposing a lock the host cannot hold: locking is tried only when the whole
+  model fits in free RAM with room to spare, loading into RAM only with enough
+  working room, and a phase with nothing to try says it was skipped.
+
+- **Split GGUFs are sized by every shard.** The tuner's host seeding read only
+  the first file of a split model — for many split releases a metadata-only
+  shard of a few megabytes — so a 100 GB model was treated as tiny. The size
+  now sums all shards.
+
 - **The `mtpturbo` engine mode is retired, following LocalBox.** `findbest
   --mode mtpturbo` is gone, and so is the one piece of search behaviour it
   owned: `mtp_minimum_n_cpu_moe`, the MoE offload floor that existed because

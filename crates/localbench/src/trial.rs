@@ -1045,7 +1045,9 @@ impl TrialRunner for LiveRunner<'_> {
                 return launch_failed(TrialFailureReason::InvalidOverrides, error.to_string())
             }
         };
-        let params = trial_launch_params(typed.to_launch_params(), &target.settings_params);
+        let mut params = trial_launch_params(typed.to_launch_params(), &target.settings_params);
+        // Spell memory-mapping flags the way the build under test accepts them.
+        params.load_flags = self.launcher.server_capabilities(target.mode).load_flags();
         let port = match self.launcher.free_port(target.port_start) {
             Ok(port) => port,
             Err(error) => {
