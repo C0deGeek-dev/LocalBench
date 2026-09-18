@@ -447,14 +447,45 @@ pub fn run_tuner_with(
             .as_deref_mut()
             .and_then(|o| o.rejection(overrides))
     };
+    // What each phase has already had ranked: a candidate the screen placed
+    // below the cut for one parent is not re-screened for another.
+    let mut already_screened: BTreeSet<String> = BTreeSet::new();
     let mut screened = |phase: &str,
                         candidates: Vec<Overrides>,
                         keep: usize,
+                        seen: &BTreeSet<String>,
                         events: &mut dyn FnMut(String)|
      -> Vec<Overrides> {
         let Some(screen) = screen.as_deref_mut() else {
             return candidates;
         };
+        // Screen what the server would actually run: each candidate at the
+        // placement its memory shape needs, minus anything this phase has
+        // already measured — a parent past the edge (a spill) would otherwise
+        // cost a whole screen for candidates that all collapse into trials
+        // already taken.
+        let mut unique: Vec<Overrides> = Vec::new();
+        for candidate in candidates {
+            let placed = if oracle_active {
+                oracle
+                    .borrow_mut()
+                    .as_deref_mut()
+                    .and_then(|o| refit_for_shape(o, &candidate, space.is_moe, slack.get()))
+                    .map_or(candidate, |(adjusted, _)| adjusted)
+            } else {
+                candidate
+            };
+            let signature = candidate_signature(&placed);
+            let key = format!("{phase}|{signature}");
+            if seen.contains(&key)
+                || already_screened.contains(&key)
+                || unique.iter().any(|c| candidate_signature(c) == signature)
+            {
+                continue;
+            }
+            unique.push(placed);
+        }
+        let candidates = unique;
         // Configurations llama.cpp cannot create go straight to the measure
         // step, which skips and reports them; they are never screened.
         let (invalid, valid): (Vec<Overrides>, Vec<Overrides>) =
@@ -464,6 +495,11 @@ pub fn run_tuner_with(
         }
         match screen.rank(&valid) {
             Some(order) => {
+                already_screened.extend(
+                    valid
+                        .iter()
+                        .map(|c| format!("{phase}|{}", candidate_signature(c))),
+                );
                 events(format!(
                     "screen [{phase}]: llama-bench ranked {} candidates; measuring the top {keep}",
                     valid.len()
@@ -867,7 +903,7 @@ pub fn run_tuner_with(
             }
         }
         let mut oomed_batching: Vec<(i64, i64)> = Vec::new();
-        for overrides in screened("batching", grid, SCREEN_KEEP, events) {
+        for overrides in screened("batching", grid, SCREEN_KEEP, &seen, events) {
             let (ub, b) = batch_of(&overrides);
             if batching_dominated(ub, b, &oomed_batching) {
                 continue;
@@ -914,7 +950,7 @@ pub fn run_tuner_with(
         let mut candidates = expand_phase_candidates(&beam, &overlays);
         if phase == "flash-attn" {
             // Flash attention is a two-way choice: keep the screen's pick per parent.
-            candidates = screened(phase, candidates, beam.len().max(1), events);
+            candidates = screened(phase, candidates, beam.len().max(1), &seen, events);
         }
         for overrides in candidates {
             measure(
@@ -948,7 +984,7 @@ pub fn run_tuner_with(
                     )
                 })
                 .collect();
-            for overrides in screened("threads", candidates, SCREEN_KEEP, events) {
+            for overrides in screened("threads", candidates, SCREEN_KEEP, &seen, events) {
                 measure(
                     &overrides,
                     "threads",
@@ -974,7 +1010,7 @@ pub fn run_tuner_with(
                 )
             })
             .collect();
-        for overrides in screened("kv-types", candidates, SCREEN_KEEP, events) {
+        for overrides in screened("kv-types", candidates, SCREEN_KEEP, &seen, events) {
             measure(
                 &overrides,
                 "kv-types",
@@ -2808,5 +2844,54 @@ mod tests {
             .iter()
             .any(|l| l.contains("runs 1 step(s) past the fitted NCpuMoe=31")));
         assert_eq!(outcome.winner.overrides.get("NCpuMoe"), Some(&json!(30)));
+    }
+
+    #[test]
+    fn the_screen_only_sees_placements_at_or_above_the_proven_edge() {
+        let mut runner = SpillRunner {
+            edge: 31,
+            measured: Vec::new(),
+        };
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: 1,
+            dense_layers: None,
+            calls: 0,
+        };
+        let mut screen = RecordingScreen { asked: Vec::new() };
+        run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: Some(&mut screen),
+            },
+            &mut |_| {},
+        )
+        .expect("a winner");
+        // The spilled probe (29) may sit in the beam, but its candidates are
+        // screened at the proven edge (30), never at 29.
+        for batch in &screen.asked {
+            for candidate in batch {
+                let moe = candidate
+                    .get("NCpuMoe")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap();
+                assert!(moe >= 30, "screened a spilled placement: {candidate:?}");
+            }
+        }
+        let mut signatures: Vec<String> = screen
+            .asked
+            .iter()
+            .flatten()
+            .map(candidate_signature)
+            .collect();
+        let total = signatures.len();
+        signatures.sort();
+        signatures.dedup();
+        assert_eq!(signatures.len(), total, "a candidate was screened twice");
     }
 }
