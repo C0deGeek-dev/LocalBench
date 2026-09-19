@@ -17,10 +17,15 @@ localbench findbest --model q36plus --context 64k --no-save     # measure only
 
 llama.cpp's own memory fitter (`llama-fit-params`, shipped with each engine)
 places the starting point, so the tuner no longer finds the VRAM edge by
-running out of memory (`--no-oracle` turns that off). The tuner then sweeps MoE
-CPU offload around that edge, batching, flash-attention, memory flags, SWA, CPU
-threads, and KV-cache types, re-measures the winner fresh before trusting it,
-and saves the result. It measures templated chat with LocalBox's
+running out of memory (`--no-oracle` turns that off). It probes past that edge
+one step at a time until a step fails, and every later candidate runs at the
+edge its own memory shape allows — a lighter KV cache moves more of the model
+onto the GPU. The tuner then sweeps batching, flash-attention, memory flags,
+SWA, CPU threads, KV-cache types, and n-gram speculative decoding, refines the
+edge, re-measures the winner fresh before trusting it, and saves the result.
+Batching (and KV types on turbo builds) are first screened in one `llama-bench`
+process, so only the best candidates cost a server start (`--no-screen` turns
+that off). It measures templated chat with LocalBox's
 single-session defaults. Decisive measurements persist in the trial cache, so a
 repeated or interrupted tune skips configs it already measured; every attempted
 or cached candidate is also recorded in a run manifest under

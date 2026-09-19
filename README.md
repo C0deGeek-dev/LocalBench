@@ -119,10 +119,12 @@ models the end-to-end feel of Claude Code or LocalPilot work, where a large
 prompt often dominates latency. Use `--optimize gen` only when decode
 throughput is the thing you explicitly care about.
 
-Every candidate is measured through `llama-server` — the same binary LocalBox
+Every result is measured through `llama-server` — the same binary LocalBox
 will actually launch — as templated `/v1/chat/completions` traffic under the
 same single-session launcher defaults. It is never approximated with
-`llama-bench` numbers. Typed failures and a per-run manifest keep an unusable
+`llama-bench` numbers: `llama-bench` only screens which candidates of a cheap
+phase get a server trial, and llama.cpp's own memory fitter only says where a
+candidate fits. Typed failures and a per-run manifest keep an unusable
 HTTP/schema/content response out of ranking while preserving its evidence.
 
 > [!NOTE]
