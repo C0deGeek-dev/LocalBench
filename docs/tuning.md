@@ -55,9 +55,11 @@ an oracle for *where* a candidate fits, never for how fast it runs:
 - **baseline** starts at the fitted placement (`NCpuMoe` for a MoE model,
   `NGpuLayers` for a dense one that does not fit whole) instead of the
   catalog default;
-- **vram-fit** probes at most two steps past it — the fitter keeps about
-  1 GiB free per device, so one or two more layers often still start — and
-  stops at the first failure. A step that starts but scores well below the one
+- **vram-fit** probes a few steps past it — the fitter keeps about 1 GiB free
+  per device, so more of the model often still starts. A MoE step moves a
+  whole block of experts, so it probes two; a dense step is one layer, so it
+  probes as many as the fitter's free memory would hold at the fitter's own
+  per-layer usage, plus one (at most six). It stops at the first failure. A step that starts but scores well below the one
   before it counts as a failure too: on Windows the GPU driver spills
   overcommitted VRAM into system memory instead of failing, and such a server
   runs at a fraction of the speed. If the fitted placement itself runs out of
@@ -66,7 +68,10 @@ an oracle for *where* a candidate fits, never for how fast it runs:
 - a later phase that changes the memory shape (KV type, batch size, flash
   attention, cache or memory flags) keeps its intent but gets the placement
   that shape needs, instead of spending a trial proving the old one no
-  longer fits;
+  longer fits. This works both ways: a lighter shape moves more of the model
+  onto the GPU — a dense model whose `q8_0` cache splits it at 256k can run
+  every layer on the GPU with a turbo cache. Refinement is the exception: it
+  measures placements next to the edge on purpose;
 - a candidate llama.cpp cannot create at all (for example a quantized V
   cache without flash attention) is skipped with the fitter's reason
   instead of spending a trial on a server that cannot start;

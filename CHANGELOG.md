@@ -4,6 +4,22 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **A lighter memory shape gets more of the model on the GPU.** Later phases
+  moved a candidate's placement only toward the CPU (when its shape needed
+  more memory), never back. A dense 27B model at 256k with a `q8_0` cache fits
+  55 of 65 layers; with a turbo cache it fits all of them and runs several
+  times faster, but the KV-types phase measured the turbo cache at 55 layers
+  and the run settled on 219.5 where the previous tuner had found 603. Each
+  candidate now runs at its own shape's edge in both directions; refinement
+  still measures the edge's neighbours.
+
+- **A dense model's VRAM probe goes as far as the fitter's margin allows.** The
+  probe past the fitted layer count stopped after two layers even when both
+  ran faster, leaving room on the GPU unused; a 27B dense model at 256k fitted
+  53 layers with 1.3 GB still free. A dense probe now takes as many single-layer
+  steps as that free memory can hold (at most six) and still stops at the
+  first failure or spill. MoE probes are unchanged.
+
 - **`llama-bench` screens the cheap axes; only the best reach the server.**
   Batching, flash attention, threads, and KV types are swept in one
   `llama-bench` process per beam parent and ranked by the tuner's own

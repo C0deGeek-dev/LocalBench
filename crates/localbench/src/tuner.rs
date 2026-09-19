@@ -119,6 +119,11 @@ const SCREEN_MIN_SAVED: usize = 3;
 /// experts on the GPU often still start; the first failure ends the probe.
 const ORACLE_PROBE_STEPS: i64 = 2;
 
+/// The most steps a dense probe takes past the oracle's edge. A dense layer is
+/// far smaller than a MoE block of experts, so the fitter's free-memory margin
+/// can hold several of them; [`oracle_probe_steps`] estimates how many.
+const ORACLE_DENSE_PROBE_MAX: i64 = 6;
+
 /// A probe step scoring below this fraction of the step before it has spilled
 /// VRAM into system memory (Windows drivers fall back instead of failing):
 /// it counts as past the edge. Measurement noise stays well above it; a spill
@@ -302,42 +307,106 @@ fn oracle_note(fit: &FitPlacement, is_moe: bool) -> String {
     }
 }
 
-/// The candidate with its placement moved to what its memory shape needs
-/// (per the oracle, corrected by the slack this host showed), when it asked
-/// for less. `None` when it already fits or the oracle cannot answer.
+/// How many placement steps past the oracle's edge the VRAM-fit phase probes.
+/// A dense model's steps are single layers: the fitter's free memory divided
+/// by its own per-layer usage says how many more might fit, plus one to find
+/// the edge. A MoE step, or a fit without a device breakdown, keeps
+/// [`ORACLE_PROBE_STEPS`]; the first failure or spill still ends the probe.
+fn oracle_probe_steps(fit: &FitPlacement, is_moe: bool) -> i64 {
+    if is_moe {
+        return ORACLE_PROBE_STEPS;
+    }
+    let Some(device) = fit
+        .devices
+        .first()
+        .filter(|d| d.layers > 0 && d.used_mib > 0)
+    else {
+        return ORACLE_PROBE_STEPS;
+    };
+    let per_layer = (device.used_mib / u64::from(device.layers)).max(1);
+    let room = i64::try_from(device.free_mib / per_layer).unwrap_or(ORACLE_DENSE_PROBE_MAX);
+    room.saturating_add(1)
+        .clamp(ORACLE_PROBE_STEPS, ORACLE_DENSE_PROBE_MAX)
+}
+
+/// The candidate with its placement moved to the edge its memory shape
+/// allows (per the oracle, corrected by the slack this host showed). A
+/// candidate that asks for more of the GPU than its shape fits is always
+/// moved back; with `raise`, one that asks for less is moved up to the edge
+/// too — a lighter shape (a smaller KV type, a smaller batch) frees memory for
+/// more of the model, and more of the model on the GPU is never slower below
+/// the edge. Refinement passes `raise = false`: it measures placements off the
+/// edge on purpose. `None` when nothing moves or the oracle cannot answer.
 fn refit_for_shape(
     oracle: &mut dyn FitOracle,
     overrides: &Overrides,
-    is_moe: bool,
+    space: &SearchSpace,
     slack: i64,
+    raise: bool,
 ) -> Option<(Overrides, String)> {
     let fit = oracle.placement(overrides)?;
     let current = |key: &str| overrides.get(key).and_then(serde_json::Value::as_i64);
-    if is_moe {
-        let floor = (fit.n_cpu_moe() - slack).max(0);
+    if space.is_moe {
+        let edge = (fit.n_cpu_moe() - slack).max(0);
         let asked = current("NCpuMoe").unwrap_or(0);
-        (asked < floor).then(|| {
+        let moves = if raise { asked != edge } else { asked < edge };
+        return moves.then(|| {
+            let why = if asked < edge {
+                "this memory shape needs more of the model on the CPU"
+            } else {
+                "this memory shape leaves room for more of the model on the GPU"
+            };
             (
-                join_overrides(overrides, &overrides_of(&[("NCpuMoe", json!(floor))])),
-                format!("NCpuMoe {asked} -> {floor}: this memory shape needs more of the model on the CPU"),
+                join_overrides(overrides, &overrides_of(&[("NCpuMoe", json!(edge))])),
+                format!("NCpuMoe {asked} -> {edge}: {why}"),
             )
-        })
+        });
+    }
+    // Dense: `-ngl` counts the repeating layers plus the output layer. No
+    // `NGpuLayers` means every layer. Without a known layer count an edge of
+    // "every layer" cannot be corrected by slack, so it is left alone.
+    let total = (space.block_count > 0).then(|| space.block_count + 1);
+    let edge = match (fit.gpu_layers, total) {
+        (layers, _) if layers >= 0 => layers,
+        (_, Some(total)) => total,
+        (_, None) => return None,
+    };
+    let cap = total.map_or((edge + slack).max(1), |total| {
+        (edge + slack).clamp(1, total)
+    });
+    let every_layer = total.is_some_and(|total| cap >= total);
+    let asked = current("NGpuLayers");
+    let asked_layers = match (asked, total) {
+        (Some(layers), Some(total)) => layers.min(total),
+        (Some(layers), None) => layers,
+        (None, _) => i64::MAX,
+    };
+    let moves = if every_layer {
+        raise && asked.is_some() && asked_layers < cap
+    } else if raise {
+        asked_layers != cap
     } else {
-        if fit.gpu_layers < 0 {
-            return None;
-        }
-        let cap = (fit.gpu_layers + slack).max(1);
-        let asked = current("NGpuLayers");
-        asked.map_or(true, |layers| layers > cap).then(|| {
+        asked_layers > cap
+    };
+    moves.then(|| {
+        let was = asked.map_or_else(|| "all".to_string(), |l| l.to_string());
+        let (placed, now) = if every_layer {
+            let mut all = overrides.clone();
+            all.remove("NGpuLayers");
+            (all, "all".to_string())
+        } else {
             (
                 join_overrides(overrides, &overrides_of(&[("NGpuLayers", json!(cap))])),
-                format!(
-                    "NGpuLayers {} -> {cap}: this memory shape does not fit every layer",
-                    asked.map_or_else(|| "all".to_string(), |l| l.to_string())
-                ),
+                cap.to_string(),
             )
-        })
-    }
+        };
+        let why = if asked_layers > cap {
+            "this memory shape does not fit every layer"
+        } else {
+            "this memory shape leaves room for more layers on the GPU"
+        };
+        (placed, format!("NGpuLayers {was} -> {now}: {why}"))
+    })
 }
 
 /// Drive the full findbest search. `events` receives one plain progress line
@@ -370,10 +439,10 @@ pub fn run_tuner(
 /// keep server-only semantics and are measured as before.
 ///
 /// With an oracle, the baseline starts at the fitted placement instead of the
-/// catalog default; the VRAM-fit phase probes at most [`ORACLE_PROBE_STEPS`]
-/// past it (and backs off at most [`ORACLE_RECOVERY_STEPS`] when the fitted
-/// placement itself runs out of memory) instead of finding the edge by
-/// provoking OOMs; later phases that change the memory shape get their
+/// catalog default; the VRAM-fit phase probes a few steps past it (see
+/// [`oracle_probe_steps`]; it backs off at most [`ORACLE_RECOVERY_STEPS`]
+/// when the fitted placement itself runs out of memory) instead of finding
+/// the edge by provoking OOMs; later phases that change the memory shape get their
 /// placement raised to what that shape needs; and the refine grid shrinks to
 /// the edge's neighbours. The oracle never produces a result: every number
 /// still comes from a real server measurement. Without one, the search is
@@ -470,7 +539,9 @@ pub fn run_tuner_with(
                 oracle
                     .borrow_mut()
                     .as_deref_mut()
-                    .and_then(|o| refit_for_shape(o, &candidate, space.is_moe, slack.get()))
+                    .and_then(|o| {
+                        refit_for_shape(o, &candidate, space, slack.get(), phase != "refine")
+                    })
                     .map_or(candidate, |(adjusted, _)| adjusted)
             } else {
                 candidate
@@ -579,7 +650,7 @@ pub fn run_tuner_with(
             oracle
                 .borrow_mut()
                 .as_deref_mut()
-                .and_then(|o| refit_for_shape(o, overrides, space.is_moe, slack.get()))
+                .and_then(|o| refit_for_shape(o, overrides, space, slack.get(), phase != "refine"))
         } else {
             None
         };
@@ -731,7 +802,10 @@ pub fn run_tuner_with(
                 let mut previous = baseline_candidate
                     .as_ref()
                     .map_or(0.0, |candidate| candidate.selected_score);
-                for step in 1..=ORACLE_PROBE_STEPS {
+                let steps = fitted.as_ref().map_or(ORACLE_PROBE_STEPS, |fit| {
+                    oracle_probe_steps(fit, space.is_moe)
+                });
+                for step in 1..=steps {
                     let value = edge + toward_gpu * step;
                     if value < lower || value > upper {
                         break;
@@ -1199,6 +1273,7 @@ mod tests {
     use localbench_scoring::score::{Telemetry, Trial, Workload};
     use localbench_search::candidate::ScoringContext;
     use localbench_search::space::{resolve_search_space, ModelAxes};
+    use localx_llama_core::fit::DeviceFit;
 
     /// Scripted runner: OOMs any config whose batch exceeds a ceiling, and
     /// otherwise scores higher for lower NCpuMoe (more GPU = faster).
@@ -2342,9 +2417,8 @@ mod tests {
         }
     }
 
-    fn ooms(runner: &VramRunner) -> Vec<String> {
-        runner
-            .measured
+    fn ooms(measured: &[(String, Overrides, bool)]) -> Vec<String> {
+        measured
             .iter()
             .filter(|(_, _, fits)| !fits)
             .map(|(phase, overrides, _)| format!("{phase}:{}", candidate_signature(overrides)))
@@ -2384,7 +2458,10 @@ mod tests {
         assert_eq!(first.get("NCpuMoe"), Some(&json!(31)));
         // One step past the edge ran, the second failed — the only OOM in the
         // whole run: refine candidates below the proven edge are refitted.
-        assert_eq!(ooms(&runner), vec!["vram-fit:KvK=q8_0;KvV=q8_0;NCpuMoe=29"]);
+        assert_eq!(
+            ooms(&runner.measured),
+            vec!["vram-fit:KvK=q8_0;KvV=q8_0;NCpuMoe=29"]
+        );
         assert!(lines
             .iter()
             .any(|l| l.contains("runs 1 step(s) past the fitted NCpuMoe=31")));
@@ -2449,7 +2526,7 @@ mod tests {
         // Baseline 28 and back-off 29 fail; 30 starts. Later shapes inherit the
         // correction, so nothing after the VRAM-fit phase runs out of memory.
         assert_eq!(
-            ooms(&runner),
+            ooms(&runner.measured),
             vec![
                 "baseline:KvK=q8_0;KvV=q8_0;NCpuMoe=28",
                 "vram-fit:KvK=q8_0;KvV=q8_0;NCpuMoe=29",
@@ -2486,10 +2563,122 @@ mod tests {
         .expect("a winner");
         assert_eq!(runner.measured[0].1.get("NGpuLayers"), Some(&json!(40)));
         assert_eq!(
-            ooms(&runner),
+            ooms(&runner.measured),
             vec!["vram-fit:KvK=q8_0;KvV=q8_0;NGpuLayers=42"]
         );
         assert_eq!(outcome.winner.overrides.get("NGpuLayers"), Some(&json!(41)));
+    }
+
+    fn device(layers: u32, used_mib: u64, free_mib: u64) -> DeviceFit {
+        DeviceFit {
+            name: "CUDA0".to_string(),
+            layers,
+            overflowing: 0,
+            used_mib,
+            free_mib,
+        }
+    }
+
+    fn fit_on(devices: Vec<DeviceFit>) -> FitPlacement {
+        FitPlacement {
+            context: Some(262_144),
+            gpu_layers: 53,
+            cpu_expert_blocks: Vec::new(),
+            tensor_overrides: None,
+            devices,
+        }
+    }
+
+    #[test]
+    fn a_dense_probe_reaches_as_far_as_the_fitters_free_memory_allows() {
+        // The live 27B dense fit: 21500 MiB for 53 layers, 1337 MiB free —
+        // about three more layers, so four steps find the edge.
+        assert_eq!(
+            oracle_probe_steps(&fit_on(vec![device(53, 21_500, 1_337)]), false),
+            4
+        );
+        assert_eq!(
+            oracle_probe_steps(&fit_on(vec![device(53, 21_500, 1_337)]), true),
+            2
+        );
+        assert_eq!(oracle_probe_steps(&fit_on(Vec::new()), false), 2);
+        assert_eq!(
+            oracle_probe_steps(&fit_on(vec![device(0, 0, 9_000)]), false),
+            2
+        );
+        assert_eq!(
+            oracle_probe_steps(&fit_on(vec![device(10, 1_000, 9_000)]), false),
+            6
+        );
+        assert_eq!(
+            oracle_probe_steps(&fit_on(vec![device(53, 21_500, 100)]), false),
+            2
+        );
+    }
+
+    #[test]
+    fn a_dense_model_probes_every_layer_the_fitters_margin_can_hold() {
+        struct Roomy(ScriptedOracle);
+        impl FitOracle for Roomy {
+            fn rejection(&mut self, overrides: &Overrides) -> Option<String> {
+                self.0.rejection(overrides)
+            }
+            fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement> {
+                self.0.placement(overrides).map(|mut fit| {
+                    // 400 MiB per layer and 1300 MiB free: room for three more.
+                    fit.devices = vec![device(40, 16_000, 1_300)];
+                    fit
+                })
+            }
+        }
+        let mut runner = VramRunner {
+            moe_edge_q8: 0,
+            dense_max: 44,
+            measured: Vec::new(),
+        };
+        let mut oracle = Roomy(ScriptedOracle {
+            moe_edge_q8: 0,
+            offset: 0,
+            dense_layers: Some(40),
+            calls: 0,
+        });
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &dense_space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a winner");
+        let probed: Vec<i64> = runner
+            .measured
+            .iter()
+            .filter(|(phase, _, _)| phase == "vram-fit")
+            .filter_map(|(_, overrides, _)| {
+                overrides
+                    .get("NGpuLayers")
+                    .and_then(serde_json::Value::as_i64)
+            })
+            .collect();
+        assert_eq!(probed, vec![41, 42, 43, 44]);
+        assert!(
+            ooms(&runner.measured).is_empty(),
+            "{:?}",
+            ooms(&runner.measured)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "oracle: this host runs 4 step(s) past the fitted NGpuLayers=40"),
+            "{lines:#?}"
+        );
+        assert_eq!(outcome.winner.overrides.get("NGpuLayers"), Some(&json!(44)));
     }
 
     #[test]
@@ -2548,11 +2737,11 @@ mod tests {
             ("KvV", json!("f16")),
             ("NCpuMoe", json!(30)),
         ]);
-        let (adjusted, note) = refit_for_shape(&mut oracle, &f16, true, 1).unwrap();
+        let (adjusted, note) = refit_for_shape(&mut oracle, &f16, &space(), 1, true).unwrap();
         assert_eq!(adjusted.get("NCpuMoe"), Some(&json!(33)));
         assert!(note.starts_with("NCpuMoe 30 -> 33"), "{note}");
         let q8 = overrides_of(&[("KvK", json!("q8_0")), ("NCpuMoe", json!(30))]);
-        assert!(refit_for_shape(&mut oracle, &q8, true, 1).is_none());
+        assert!(refit_for_shape(&mut oracle, &q8, &space(), 1, true).is_none());
         let dense = ScriptedOracle {
             moe_edge_q8: 0,
             offset: 0,
@@ -2561,8 +2750,152 @@ mod tests {
         };
         let mut dense = dense;
         let all_layers = overrides_of(&[("KvK", json!("q8_0"))]);
-        let (capped, _) = refit_for_shape(&mut dense, &all_layers, false, 1).unwrap();
+        let (capped, _) =
+            refit_for_shape(&mut dense, &all_layers, &dense_space(), 1, true).unwrap();
         assert_eq!(capped.get("NGpuLayers"), Some(&json!(41)));
+    }
+
+    /// Answers a dense placement by KV type: q8_0 fits `q8_layers`, anything
+    /// lighter fits every layer.
+    struct KvDenseOracle {
+        q8_layers: i64,
+    }
+
+    impl FitOracle for KvDenseOracle {
+        fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement> {
+            let q8 = overrides.get("KvK").and_then(serde_json::Value::as_str) == Some("q8_0");
+            Some(FitPlacement {
+                context: Some(262_144),
+                gpu_layers: if q8 { self.q8_layers } else { -1 },
+                cpu_expert_blocks: Vec::new(),
+                tensor_overrides: None,
+                devices: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_lighter_memory_shape_is_raised_to_its_own_edge() {
+        // MoE: the q8_0 edge is 31 blocks on the CPU; this host runs one
+        // closer (slack 1). A candidate inherited from an f16 parent at 33
+        // moves down to 30 — except in refinement, which stays off the edge.
+        let mut oracle = ScriptedOracle {
+            moe_edge_q8: 30,
+            offset: 1,
+            dense_layers: None,
+            calls: 0,
+        };
+        let from_f16 = overrides_of(&[
+            ("KvK", json!("q8_0")),
+            ("KvV", json!("q8_0")),
+            ("NCpuMoe", json!(33)),
+        ]);
+        let (raised, note) = refit_for_shape(&mut oracle, &from_f16, &space(), 1, true).unwrap();
+        assert_eq!(raised.get("NCpuMoe"), Some(&json!(30)));
+        assert!(
+            note.contains("room for more of the model on the GPU"),
+            "{note}"
+        );
+        assert!(refit_for_shape(&mut oracle, &from_f16, &space(), 1, false).is_none());
+
+        // Dense: q8_0 at 256k fits 53 layers, a lighter KV type every layer.
+        let mut dense = KvDenseOracle { q8_layers: 53 };
+        let turbo_at_55 = overrides_of(&[("KvK", json!("q4_0")), ("NGpuLayers", json!(55))]);
+        let (all, note) =
+            refit_for_shape(&mut dense, &turbo_at_55, &dense_space(), 2, true).unwrap();
+        assert_eq!(all.get("NGpuLayers"), None, "no NGpuLayers = every layer");
+        assert!(note.starts_with("NGpuLayers 55 -> all"), "{note}");
+        assert!(refit_for_shape(&mut dense, &turbo_at_55, &dense_space(), 2, false).is_none());
+        let q8_at_55 = overrides_of(&[("KvK", json!("q8_0")), ("NGpuLayers", json!(55))]);
+        assert!(refit_for_shape(&mut dense, &q8_at_55, &dense_space(), 2, true).is_none());
+        let q8_at_50 = overrides_of(&[("KvK", json!("q8_0")), ("NGpuLayers", json!(50))]);
+        let (up, _) = refit_for_shape(&mut dense, &q8_at_50, &dense_space(), 2, true).unwrap();
+        assert_eq!(up.get("NGpuLayers"), Some(&json!(55)));
+        // A layer count past the model's own is "every layer" already.
+        let q4_all = overrides_of(&[("KvK", json!("q4_0")), ("NGpuLayers", json!(999))]);
+        assert!(refit_for_shape(&mut dense, &q4_all, &dense_space(), 0, true).is_none());
+    }
+
+    /// A dense model whose q8_0 KV cache fits `q8_max` layers and whose
+    /// lighter KV types fit every layer; speed rises with layers on the GPU.
+    struct KvDenseRunner {
+        q8_max: i64,
+        measured: Vec<(String, Overrides, bool)>,
+    }
+
+    impl TrialRunner for KvDenseRunner {
+        fn measure(&mut self, overrides: &Overrides, phase: &str) -> Trial {
+            let q8 = overrides.get("KvK").and_then(serde_json::Value::as_str) == Some("q8_0");
+            let layers = overrides
+                .get("NGpuLayers")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(66)
+                .min(66);
+            let fits = !q8 || layers <= self.q8_max;
+            self.measured
+                .push((phase.to_string(), overrides.clone(), fits));
+            if !fits {
+                return failed_trial(true);
+            }
+            // Every layer on the GPU is several times faster than a split.
+            let speed = if layers >= 66 { 400.0 } else { layers as f64 };
+            Trial {
+                startup_ok: true,
+                oom: false,
+                measurement_usable: true,
+                pp_tps: 500.0 + speed,
+                tg_tps: 20.0 + speed,
+                variance: Some(0.01),
+                telemetry: Telemetry::default(),
+                ..Trial::default()
+            }
+        }
+    }
+
+    #[test]
+    fn a_dense_model_moves_every_layer_to_the_gpu_when_a_lighter_kv_type_allows_it() {
+        let mut runner = KvDenseRunner {
+            q8_max: 55,
+            measured: Vec::new(),
+        };
+        let mut oracle = KvDenseOracle { q8_layers: 53 };
+        // Only the turboquant build sweeps lighter KV types.
+        let turbo = TunerParams {
+            mode: localx_llama_core::Mode::Turboquant,
+            ..params()
+        };
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &dense_space(),
+            &seeds(),
+            &ctx(),
+            &turbo,
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a winner");
+        assert!(
+            ooms(&runner.measured).len() <= 1,
+            "{:?}",
+            ooms(&runner.measured)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("oracle [kv-types]: NGpuLayers 55 -> all")),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            outcome.winner.overrides.get("NGpuLayers"),
+            None,
+            "{:?}",
+            outcome.winner.overrides
+        );
+        assert_ne!(outcome.winner.overrides.get("KvK"), Some(&json!("q8_0")));
     }
 
     /// Ranks batching candidates by ubatch size, largest first; answers
