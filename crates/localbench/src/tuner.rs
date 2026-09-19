@@ -119,10 +119,12 @@ const SCREEN_MIN_SAVED: usize = 3;
 /// experts on the GPU often still start; the first failure ends the probe.
 const ORACLE_PROBE_STEPS: i64 = 2;
 
-/// The most steps a dense probe takes past the oracle's edge. A dense layer is
-/// far smaller than a MoE block of experts, so the fitter's free-memory margin
-/// can hold several of them; [`oracle_probe_steps`] estimates how many.
-const ORACLE_DENSE_PROBE_MAX: i64 = 6;
+/// The same for a dense model, whose step is one layer: far smaller than a
+/// MoE block of experts, so the fitter's margin can hold several. The fitter's
+/// own usage per layer includes the KV cache and compute buffers and so
+/// undercounts them (a 27B model fitted 53 layers at 256k and ran 57, still
+/// gaining); the probe goes on until a step fails or spills.
+const ORACLE_DENSE_PROBE_STEPS: i64 = 6;
 
 /// A probe step scoring below this fraction of the step before it has spilled
 /// VRAM into system memory (Windows drivers fall back instead of failing):
@@ -307,28 +309,6 @@ fn oracle_note(fit: &FitPlacement, is_moe: bool) -> String {
     }
 }
 
-/// How many placement steps past the oracle's edge the VRAM-fit phase probes.
-/// A dense model's steps are single layers: the fitter's free memory divided
-/// by its own per-layer usage says how many more might fit, plus one to find
-/// the edge. A MoE step, or a fit without a device breakdown, keeps
-/// [`ORACLE_PROBE_STEPS`]; the first failure or spill still ends the probe.
-fn oracle_probe_steps(fit: &FitPlacement, is_moe: bool) -> i64 {
-    if is_moe {
-        return ORACLE_PROBE_STEPS;
-    }
-    let Some(device) = fit
-        .devices
-        .first()
-        .filter(|d| d.layers > 0 && d.used_mib > 0)
-    else {
-        return ORACLE_PROBE_STEPS;
-    };
-    let per_layer = (device.used_mib / u64::from(device.layers)).max(1);
-    let room = i64::try_from(device.free_mib / per_layer).unwrap_or(ORACLE_DENSE_PROBE_MAX);
-    room.saturating_add(1)
-        .clamp(ORACLE_PROBE_STEPS, ORACLE_DENSE_PROBE_MAX)
-}
-
 /// The candidate with its placement moved to the edge its memory shape
 /// allows (per the oracle, corrected by the slack this host showed). A
 /// candidate that asks for more of the GPU than its shape fits is always
@@ -440,7 +420,7 @@ pub fn run_tuner(
 ///
 /// With an oracle, the baseline starts at the fitted placement instead of the
 /// catalog default; the VRAM-fit phase probes a few steps past it (see
-/// [`oracle_probe_steps`]; it backs off at most [`ORACLE_RECOVERY_STEPS`]
+/// [`ORACLE_PROBE_STEPS`]; it backs off at most [`ORACLE_RECOVERY_STEPS`]
 /// when the fitted placement itself runs out of memory) instead of finding
 /// the edge by provoking OOMs; later phases that change the memory shape get their
 /// placement raised to what that shape needs; and the refine grid shrinks to
@@ -802,9 +782,11 @@ pub fn run_tuner_with(
                 let mut previous = baseline_candidate
                     .as_ref()
                     .map_or(0.0, |candidate| candidate.selected_score);
-                let steps = fitted.as_ref().map_or(ORACLE_PROBE_STEPS, |fit| {
-                    oracle_probe_steps(fit, space.is_moe)
-                });
+                let steps = if space.is_moe {
+                    ORACLE_PROBE_STEPS
+                } else {
+                    ORACLE_DENSE_PROBE_STEPS
+                };
                 for step in 1..=steps {
                     let value = edge + toward_gpu * step;
                     if value < lower || value > upper {
@@ -1273,7 +1255,6 @@ mod tests {
     use localbench_scoring::score::{Telemetry, Trial, Workload};
     use localbench_search::candidate::ScoringContext;
     use localbench_search::space::{resolve_search_space, ModelAxes};
-    use localx_llama_core::fit::DeviceFit;
 
     /// Scripted runner: OOMs any config whose batch exceeds a ceiling, and
     /// otherwise scores higher for lower NCpuMoe (more GPU = faster).
@@ -2569,79 +2550,21 @@ mod tests {
         assert_eq!(outcome.winner.overrides.get("NGpuLayers"), Some(&json!(41)));
     }
 
-    fn device(layers: u32, used_mib: u64, free_mib: u64) -> DeviceFit {
-        DeviceFit {
-            name: "CUDA0".to_string(),
-            layers,
-            overflowing: 0,
-            used_mib,
-            free_mib,
-        }
-    }
-
-    fn fit_on(devices: Vec<DeviceFit>) -> FitPlacement {
-        FitPlacement {
-            context: Some(262_144),
-            gpu_layers: 53,
-            cpu_expert_blocks: Vec::new(),
-            tensor_overrides: None,
-            devices,
-        }
-    }
-
     #[test]
-    fn a_dense_probe_reaches_as_far_as_the_fitters_free_memory_allows() {
-        // The live 27B dense fit: 21500 MiB for 53 layers, 1337 MiB free —
-        // about three more layers, so four steps find the edge.
-        assert_eq!(
-            oracle_probe_steps(&fit_on(vec![device(53, 21_500, 1_337)]), false),
-            4
-        );
-        assert_eq!(
-            oracle_probe_steps(&fit_on(vec![device(53, 21_500, 1_337)]), true),
-            2
-        );
-        assert_eq!(oracle_probe_steps(&fit_on(Vec::new()), false), 2);
-        assert_eq!(
-            oracle_probe_steps(&fit_on(vec![device(0, 0, 9_000)]), false),
-            2
-        );
-        assert_eq!(
-            oracle_probe_steps(&fit_on(vec![device(10, 1_000, 9_000)]), false),
-            6
-        );
-        assert_eq!(
-            oracle_probe_steps(&fit_on(vec![device(53, 21_500, 100)]), false),
-            2
-        );
-    }
-
-    #[test]
-    fn a_dense_model_probes_every_layer_the_fitters_margin_can_hold() {
-        struct Roomy(ScriptedOracle);
-        impl FitOracle for Roomy {
-            fn rejection(&mut self, overrides: &Overrides) -> Option<String> {
-                self.0.rejection(overrides)
-            }
-            fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement> {
-                self.0.placement(overrides).map(|mut fit| {
-                    // 400 MiB per layer and 1300 MiB free: room for three more.
-                    fit.devices = vec![device(40, 16_000, 1_300)];
-                    fit
-                })
-            }
-        }
+    fn a_dense_probe_runs_until_a_layer_no_longer_fits() {
+        // The fitter says 40; this host runs 44. Four steps start and gain,
+        // the fifth fails and ends the probe.
         let mut runner = VramRunner {
             moe_edge_q8: 0,
             dense_max: 44,
             measured: Vec::new(),
         };
-        let mut oracle = Roomy(ScriptedOracle {
+        let mut oracle = ScriptedOracle {
             moe_edge_q8: 0,
             offset: 0,
             dense_layers: Some(40),
             calls: 0,
-        });
+        };
         let mut lines = Vec::new();
         let outcome = run_tuner_with(
             &mut runner,
@@ -2666,11 +2589,10 @@ mod tests {
                     .and_then(serde_json::Value::as_i64)
             })
             .collect();
-        assert_eq!(probed, vec![41, 42, 43, 44]);
-        assert!(
-            ooms(&runner.measured).is_empty(),
-            "{:?}",
-            ooms(&runner.measured)
+        assert_eq!(probed, vec![41, 42, 43, 44, 45]);
+        assert_eq!(
+            ooms(&runner.measured),
+            vec!["vram-fit:KvK=q8_0;KvV=q8_0;NGpuLayers=45"]
         );
         assert!(
             lines

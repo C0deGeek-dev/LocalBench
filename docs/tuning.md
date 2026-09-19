@@ -58,8 +58,7 @@ an oracle for *where* a candidate fits, never for how fast it runs:
 - **vram-fit** probes a few steps past it — the fitter keeps about 1 GiB free
   per device, so more of the model often still starts. A MoE step moves a
   whole block of experts, so it probes two; a dense step is one layer, so it
-  probes as many as the fitter's free memory would hold at the fitter's own
-  per-layer usage, plus one (at most six). It stops at the first failure. A step that starts but scores well below the one
+  probes up to six. It stops at the first failure. A step that starts but scores well below the one
   before it counts as a failure too: on Windows the GPU driver spills
   overcommitted VRAM into system memory instead of failing, and such a server
   runs at a fraction of the speed. If the fitted placement itself runs out of
