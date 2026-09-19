@@ -55,10 +55,10 @@ an oracle for *where* a candidate fits, never for how fast it runs:
 - **baseline** starts at the fitted placement (`NCpuMoe` for a MoE model,
   `NGpuLayers` for a dense one that does not fit whole) instead of the
   catalog default;
-- **vram-fit** probes a few steps past it — the fitter keeps about 1 GiB free
-  per device, so more of the model often still starts. A MoE step moves a
-  whole block of experts, so it probes two; a dense step is one layer, so it
-  probes up to six. It stops at the first failure. A step that starts but scores well below the one
+- **vram-fit** probes past it one step at a time (one expert block for a MoE
+  model, one layer for a dense one) — the fitter keeps about 1 GiB free per
+  device, so more of the model often still starts — and stops at the first
+  failure, or after six steps. A step that starts but scores well below the one
   before it counts as a failure too: on Windows the GPU driver spills
   overcommitted VRAM into system memory instead of failing, and such a server
   runs at a fraction of the speed. If the fitted placement itself runs out of
@@ -93,7 +93,8 @@ For each beam parent, `findbest` runs the phase's candidates through one
 ranks them by the same objective the tuner optimizes, and measures only the
 best two on the server. A screen loads the model once, which on a fast-loading
 model costs about two server trials, so a phase is only screened when that saves
-at least three trials (in practice batching and, on turbo builds, KV types);
+at least three trials (in practice batching and, on turbo builds, KV types),
+and never for a phase that has already spent its share of the trial budget;
 configurations the memory fitter already rejects are never handed to it. The screen is
 never a result: its numbers are not scored, cached, ranked against server
 trials, verified, or saved, and a screen that cannot answer leaves the phase

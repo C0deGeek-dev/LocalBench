@@ -15,17 +15,17 @@ Past-tense record of shipped changes, newest first.
   layer on the GPU, turbo3 cache, n-gram drafting) in 26 trials and 35
   minutes.
 
-- **A dense model's VRAM probe goes as far as the GPU allows.** The probe past
-  the fitted layer count stopped after two layers even when both ran faster,
-  leaving room on the GPU unused: a 27B dense model at 256k fitted 53 layers
-  and ran 57, each step faster than the last. A dense probe now takes up to
-  six single-layer steps and stops at the first failure or spill. MoE probes
-  are unchanged.
+- **The VRAM probe goes as far as the GPU allows.** The probe past the fitted
+  placement stopped after two steps even when both ran faster, leaving room on
+  the GPU unused: a 27B dense model at 256k fitted 53 layers and ran 57, and a
+  35B MoE fitted 6 expert blocks on the CPU and ran 4, each step faster than
+  the last. The probe now goes on until a step fails or spills (at most six).
 
 - **`llama-bench` screens the cheap axes; only the best reach the server.**
   Batching, flash attention, threads, and KV types are swept in one
   `llama-bench` process per beam parent and ranked by the tuner's own
-  objective; only the top two per parent get a full server trial. Screen
+  objective; only the top two per parent get a full server trial, and a phase
+  that has spent its share of the trial budget is not screened again. Screen
   numbers are never scored, cached, or saved. `--no-screen` restores
   server-only measurement; the findbest JSON reports `search_aids`.
 
@@ -40,8 +40,8 @@ Past-tense record of shipped changes, newest first.
 
 - **`findbest` asks llama.cpp where a model fits instead of finding out by
   crashing.** The engine's own `llama-fit-params` places the baseline and
-  bounds the VRAM search: the VRAM-fit phase probes at most two steps past the
-  fitted placement (backing off one step at a time if the fitter was
+  bounds the VRAM search: the VRAM-fit phase probes from the fitted placement
+  until a step fails (backing off one step at a time if the fitter was
   optimistic), later phases that change the memory shape get the placement
   that shape needs, and refinement measures only the fitted edge's
   neighbours. The out-of-memory ladders that located the edge by trial remain

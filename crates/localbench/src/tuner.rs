@@ -114,17 +114,12 @@ const SCREEN_KEEP: usize = 2;
 /// measured directly.
 const SCREEN_MIN_SAVED: usize = 3;
 
-/// How many placement steps past the oracle's edge the VRAM-fit phase probes.
-/// The fitter keeps a free-memory margin, so one or two more layers of
-/// experts on the GPU often still start; the first failure ends the probe.
-const ORACLE_PROBE_STEPS: i64 = 2;
-
-/// The same for a dense model, whose step is one layer: far smaller than a
-/// MoE block of experts, so the fitter's margin can hold several. The fitter's
-/// own usage per layer includes the KV cache and compute buffers and so
-/// undercounts them (a 27B model fitted 53 layers at 256k and ran 57, still
-/// gaining); the probe goes on until a step fails or spills.
-const ORACLE_DENSE_PROBE_STEPS: i64 = 6;
+/// The most placement steps past the oracle's edge the VRAM-fit phase probes.
+/// The fitter keeps a free-memory margin, so more of the model often still
+/// starts — four more dense layers for a 27B model at 256k, two more expert
+/// blocks for a 35B MoE, each step faster than the last. The probe goes on
+/// until a step fails or spills; this only bounds a very conservative fit.
+const ORACLE_PROBE_STEPS: i64 = 6;
 
 /// A probe step scoring below this fraction of the step before it has spilled
 /// VRAM into system memory (Windows drivers fall back instead of failing):
@@ -419,10 +414,10 @@ pub fn run_tuner(
 /// keep server-only semantics and are measured as before.
 ///
 /// With an oracle, the baseline starts at the fitted placement instead of the
-/// catalog default; the VRAM-fit phase probes a few steps past it (see
-/// [`ORACLE_PROBE_STEPS`]; it backs off at most [`ORACLE_RECOVERY_STEPS`]
-/// when the fitted placement itself runs out of memory) instead of finding
-/// the edge by provoking OOMs; later phases that change the memory shape get their
+/// catalog default; the VRAM-fit phase probes past it until a step fails or
+/// spills (at most [`ORACLE_PROBE_STEPS`]; it backs off at most
+/// [`ORACLE_RECOVERY_STEPS`] when the fitted placement itself runs out of
+/// memory) instead of finding the edge from the catalog default by OOMs; later phases that change the memory shape get their
 /// placement raised to what that shape needs; and the refine grid shrinks to
 /// the edge's neighbours. The oracle never produces a result: every number
 /// still comes from a real server measurement. Without one, the search is
@@ -447,7 +442,9 @@ pub fn run_tuner_with(
     let mut trials = 0_usize;
     let mut history: Vec<Candidate> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut phase_gate: Option<PhaseGate> = None;
+    // Shared by the measure step (which sets it) and the screen (which must
+    // not rank candidates a phase has no trials left to measure).
+    let phase_gate: std::cell::RefCell<Option<PhaseGate>> = std::cell::RefCell::new(None);
 
     // ----- Phase 1 setup: the baseline, placed by the oracle when there is one -----
     let mut baseline = overrides_of(&[
@@ -502,12 +499,24 @@ pub fn run_tuner_with(
     let mut screened = |phase: &str,
                         candidates: Vec<Overrides>,
                         keep: usize,
+                        trials: usize,
                         seen: &BTreeSet<String>,
                         events: &mut dyn FnMut(String)|
      -> Vec<Overrides> {
         let Some(screen) = screen.as_deref_mut() else {
             return candidates;
         };
+        // A phase that has spent its reserve measures nothing more: ranking
+        // its remaining parents' candidates would cost a whole llama-bench
+        // run for nothing.
+        let spent = trials as i64 >= search_budget
+            || phase_gate
+                .borrow()
+                .as_ref()
+                .is_some_and(|gate| gate.phase == phase && trials as i64 >= gate.ceiling);
+        if spent {
+            return Vec::new();
+        }
         // Screen what the server would actually run: each candidate at the
         // placement its memory shape needs, minus anything this phase has
         // already measured — a parent past the edge (a spill) would otherwise
@@ -585,11 +594,12 @@ pub fn run_tuner_with(
         }
         // And keep every later phase's floor, so beam width buys breadth
         // within a phase instead of taking the phases that follow it.
-        let ceiling = match &phase_gate {
+        let mut gate_slot = phase_gate.borrow_mut();
+        let ceiling = match gate_slot.as_ref() {
             Some(gate) if gate.phase == phase => gate.ceiling,
             _ => {
                 let ceiling = phase_ceiling(phase, *trials, search_budget);
-                phase_gate = Some(PhaseGate {
+                *gate_slot = Some(PhaseGate {
                     phase: phase.to_string(),
                     ceiling,
                     announced: false,
@@ -598,7 +608,7 @@ pub fn run_tuner_with(
             }
         };
         if *trials as i64 >= ceiling {
-            if let Some(gate) = phase_gate.as_mut() {
+            if let Some(gate) = gate_slot.as_mut() {
                 if !gate.announced {
                     gate.announced = true;
                     events(format!(
@@ -608,6 +618,7 @@ pub fn run_tuner_with(
             }
             return None;
         }
+        drop(gate_slot);
         // A configuration llama.cpp cannot even create is not worth a trial.
         if oracle_active && !matches!(phase, "baseline" | "vram-fit") {
             if let Some(reason) = rejected(overrides) {
@@ -782,12 +793,7 @@ pub fn run_tuner_with(
                 let mut previous = baseline_candidate
                     .as_ref()
                     .map_or(0.0, |candidate| candidate.selected_score);
-                let steps = if space.is_moe {
-                    ORACLE_PROBE_STEPS
-                } else {
-                    ORACLE_DENSE_PROBE_STEPS
-                };
-                for step in 1..=steps {
+                for step in 1..=ORACLE_PROBE_STEPS {
                     let value = edge + toward_gpu * step;
                     if value < lower || value > upper {
                         break;
@@ -959,7 +965,7 @@ pub fn run_tuner_with(
             }
         }
         let mut oomed_batching: Vec<(i64, i64)> = Vec::new();
-        for overrides in screened("batching", grid, SCREEN_KEEP, &seen, events) {
+        for overrides in screened("batching", grid, SCREEN_KEEP, trials, &seen, events) {
             let (ub, b) = batch_of(&overrides);
             if batching_dominated(ub, b, &oomed_batching) {
                 continue;
@@ -1006,7 +1012,7 @@ pub fn run_tuner_with(
         let mut candidates = expand_phase_candidates(&beam, &overlays);
         if phase == "flash-attn" {
             // Flash attention is a two-way choice: keep the screen's pick per parent.
-            candidates = screened(phase, candidates, beam.len().max(1), &seen, events);
+            candidates = screened(phase, candidates, beam.len().max(1), trials, &seen, events);
         }
         for overrides in candidates {
             measure(
@@ -1040,7 +1046,7 @@ pub fn run_tuner_with(
                     )
                 })
                 .collect();
-            for overrides in screened("threads", candidates, SCREEN_KEEP, &seen, events) {
+            for overrides in screened("threads", candidates, SCREEN_KEEP, trials, &seen, events) {
                 measure(
                     &overrides,
                     "threads",
@@ -1066,7 +1072,7 @@ pub fn run_tuner_with(
                 )
             })
             .collect();
-        for overrides in screened("kv-types", candidates, SCREEN_KEEP, &seen, events) {
+        for overrides in screened("kv-types", candidates, SCREEN_KEEP, trials, &seen, events) {
             measure(
                 &overrides,
                 "kv-types",
@@ -3033,6 +3039,61 @@ mod tests {
         }
         assert!(!lines.iter().any(|l| l.starts_with("screen [threads]")));
         assert!(!lines.iter().any(|l| l.starts_with("screen [flash-attn]")));
+    }
+
+    #[test]
+    fn a_phase_that_spent_its_reserve_is_not_screened_again() {
+        // Turboquant sweeps five KV pairs per parent, so every parent's
+        // kv-types candidates are large enough to screen. Across budgets, the
+        // kv-types reserve runs out before the last parent for some of them;
+        // after that, no screen may run for the phase.
+        let mut exhausted = 0;
+        for budget in 12..=30 {
+            let turbo = TunerParams {
+                mode: localx_llama_core::Mode::Turboquant,
+                budget,
+                ..params()
+            };
+            let mut runner = KvDenseRunner {
+                q8_max: 55,
+                measured: Vec::new(),
+            };
+            let mut oracle = KvDenseOracle { q8_layers: 53 };
+            let mut screen = RecordingScreen { asked: Vec::new() };
+            let mut lines = Vec::new();
+            run_tuner_with(
+                &mut runner,
+                &dense_space(),
+                &seeds(),
+                &ctx(),
+                &turbo,
+                TunerAids {
+                    oracle: Some(&mut oracle),
+                    screen: Some(&mut screen),
+                },
+                &mut |line| lines.push(line),
+            )
+            .expect("a winner");
+            let mut spent: Vec<String> = Vec::new();
+            for line in &lines {
+                if let Some(rest) = line.strip_prefix("phase ") {
+                    if let Some((phase, _)) = rest.split_once(": reserve reached") {
+                        spent.push(phase.to_string());
+                    }
+                }
+                if let Some(rest) = line.strip_prefix("screen [") {
+                    let phase = rest.split(']').next().unwrap_or_default();
+                    assert!(
+                        !spent.iter().any(|p| p == phase),
+                        "budget {budget}: {phase} was screened after its reserve ran out: {lines:#?}"
+                    );
+                }
+            }
+            if spent.iter().any(|p| p == "kv-types") {
+                exhausted += 1;
+            }
+        }
+        assert!(exhausted > 0, "no budget exhausted the kv-types reserve");
     }
 
     /// Past `edge - 1` the driver spills to system memory: the server starts
