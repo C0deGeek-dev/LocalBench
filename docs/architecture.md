@@ -38,6 +38,10 @@ crates/
     consumer.rs                     launcher-contract consumer gate
     trial.rs                        live trial runner over the launcher + cached runner
     tuner.rs                        findbest phase orchestration
+    oracle.rs                       llama-fit-params placement oracle for findbest
+    screen.rs                       llama-bench screen that orders cheap-phase candidates
+    gguf.rs                         minimal GGUF header reader (dense vs MoE, layer count)
+    coach.rs                        scripted MCP coach for coached benchmark arms
     diagnostics.rs                  append-only per-attempt run evidence + retention
     solver.rs                       bounded process-tree runner + localpilot eval seam
     matrix.rs                       live matrix, container executor + exact compensation
