@@ -350,12 +350,6 @@ mod tests {
         fn server_binary(&self, _mode: Mode, _ni: bool) -> Result<PathBuf, LauncherError> {
             Ok(PathBuf::from("llama-server"))
         }
-        fn bench_binary(&self, _ni: bool) -> Option<PathBuf> {
-            None
-        }
-        fn perplexity_binary(&self, _ni: bool, _mode: Mode) -> Option<PathBuf> {
-            None
-        }
         fn install_root(&self, _mode: Mode) -> PathBuf {
             PathBuf::from(".")
         }
@@ -376,9 +370,6 @@ mod tests {
         }
         fn stop_server(&self, _quiet: bool) {}
         fn set_backend_session(&self, _session: &BackendSession) {}
-        fn expand_path(&self, path: &str) -> PathBuf {
-            PathBuf::from(path)
-        }
     }
 
     #[test]

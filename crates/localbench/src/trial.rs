@@ -2067,12 +2067,6 @@ mod tests {
         ) -> Result<PathBuf, LauncherError> {
             unimplemented!("launcher not used past spawn")
         }
-        fn bench_binary(&self, _non_interactive: bool) -> Option<PathBuf> {
-            unimplemented!("launcher not used past spawn")
-        }
-        fn perplexity_binary(&self, _non_interactive: bool, _mode: Mode) -> Option<PathBuf> {
-            unimplemented!("launcher not used past spawn")
-        }
         fn install_root(&self, _mode: Mode) -> PathBuf {
             unimplemented!("launcher not used past spawn")
         }
@@ -2089,9 +2083,6 @@ mod tests {
             unimplemented!("launcher not used past spawn")
         }
         fn set_backend_session(&self, _session: &BackendSession) {
-            unimplemented!("launcher not used past spawn")
-        }
-        fn expand_path(&self, _path: &str) -> PathBuf {
             unimplemented!("launcher not used past spawn")
         }
     }

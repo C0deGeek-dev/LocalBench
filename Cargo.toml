@@ -55,8 +55,8 @@ sysinfo = "=0.32.1"
 # Launcher trait — the diamond-dep breakage), so advance the -core/-runtime
 # revs only together with a localbox-launcher re-pin whose own -core pin
 # matches.
-localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "71b4b26cf47d7f30c29f144a4592f0664c2b38c3" }
-localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "71b4b26cf47d7f30c29f144a4592f0664c2b38c3" }
-localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "71b4b26cf47d7f30c29f144a4592f0664c2b38c3" }
-localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "61bec8480e40b27bfae0cce1b834c2ef4a30d789" }
+localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "007f4dbf2a907488a6fc9fc987d8475926548b95" }
+localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "007f4dbf2a907488a6fc9fc987d8475926548b95" }
+localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "007f4dbf2a907488a6fc9fc987d8475926548b95" }
+localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "c3af2f15b3633a79b3e7f63fdfd8362ad768035f" }
 
