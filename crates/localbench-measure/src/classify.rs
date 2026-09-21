@@ -34,6 +34,25 @@ fn failure_regexes() -> &'static Vec<Regex> {
     })
 }
 
+/// The CUDA runtime failing to initialise while the server loads. Seen on
+/// Windows when the host has run out of commit (RAM plus page file) — a load
+/// without mmap makes the CPU-side weights private while the display driver
+/// backs the GPU's memory with host commit — and when another model is
+/// loading on the same GPU. It is not a VRAM out-of-memory. Pinned from a real
+/// failure (llama.cpp b11034, RTX 4090, Windows 11).
+pub const CUDA_INIT_FAILURE_PATTERNS: &[&str] =
+    &["cuda error: shared object initialization failed"];
+
+/// Whether the text carries a CUDA initialisation failure (see
+/// [`CUDA_INIT_FAILURE_PATTERNS`]).
+#[must_use]
+pub fn is_cuda_init_failure(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    CUDA_INIT_FAILURE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
 /// Whether the text carries an OOM/allocation-failure signature.
 #[must_use]
 pub fn is_oom_message(text: &str) -> bool {
@@ -76,6 +95,16 @@ pub const QUALITY_MIN_WORDS: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cuda_init_failure_is_recognised_and_is_not_an_oom() {
+        // The real log line from a no-mmap Flash-Next start at the commit limit.
+        let log = "0.28.021.740 E CUDA error: shared object initialization failed\n\
+                   0.28.021.751 E   current device: 0, in function ggml_cuda_kernel_can_use_pdl";
+        assert!(is_cuda_init_failure(log));
+        assert!(!is_oom_message(log));
+        assert!(!is_cuda_init_failure("CUDA error: out of memory"));
+    }
 
     #[test]
     fn classifies_the_pinned_oom_signatures() {

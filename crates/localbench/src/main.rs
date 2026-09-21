@@ -420,9 +420,31 @@ fn gguf_total_size_gb(gguf: &std::path::Path) -> f64 {
 }
 
 fn probe_available_ram_gb() -> f64 {
-    let mut system = sysinfo::System::new_all();
+    let mut system = sysinfo::System::new();
     system.refresh_memory();
     system.available_memory() as f64 / 1_073_741_824.0
+}
+
+/// Memory the host can still commit before the tuner starts a server.
+fn probe_commit_available_gb() -> f64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    localbench::trial::host_commit_headroom_gb(&system)
+}
+
+/// Model bytes (GiB) the build keeps memory-mapped even when it loads the
+/// model without mmap: a per-layer embedding table larger than the build's
+/// lazy-read threshold, read from disk on demand. `0.0` for a build without
+/// `--lazy-mode` or a model without such a table.
+fn lazy_mapped_gb(gguf: &std::path::Path, lazy_mode: bool) -> f64 {
+    if !lazy_mode {
+        return 0.0;
+    }
+    localx_llama_core::quant::shard_files_from_primary(&gguf.to_string_lossy())
+        .iter()
+        .find_map(|shard| localbench::gguf::lazy_table_bytes(std::path::Path::new(shard)))
+        .filter(|bytes| *bytes > localbench::gguf::LAZY_AUTO_MIN_BYTES)
+        .map_or(0.0, |bytes| bytes as f64 / 1_073_741_824.0)
 }
 
 /// GPU names for the trial-cache fingerprint — a GPU swap (same VRAM GB) must
@@ -758,6 +780,10 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
             logical_cores: cores,
             available_ram_gb: probe_available_ram_gb(),
             gguf_size_gb: gguf_total_size_gb(&gguf),
+            commit_available_gb: probe_commit_available_gb(),
+            lazy_mapped_gb: lazy_mapped_gb(&gguf, launcher.server_capabilities(mode).lazy_mode),
+            // The Windows display driver backs device memory with host commit.
+            vram_backed_by_host_commit: cfg!(windows),
         },
         localbench::tuner::rank_profile(profile),
     );

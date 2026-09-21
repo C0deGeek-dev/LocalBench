@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use localbench_measure::cache::stable_json_hash;
 use localbench_measure::classify::{
-    is_oom_message, output_quality_ok, QUALITY_MIN_CHARS, QUALITY_MIN_WORDS,
+    is_cuda_init_failure, is_oom_message, output_quality_ok, QUALITY_MIN_CHARS, QUALITY_MIN_WORDS,
 };
 use localbench_measure::prompt::coding_agent_stress_prompt;
 use localbench_scoring::score::Overrides;
@@ -564,6 +564,7 @@ fn startup_failed_trial(
     let (oom, reason) = match startup_failure {
         StartupFailure::ExitedOom => (true, TrialFailureReason::ReadinessExitedOom),
         StartupFailure::Exited => (false, TrialFailureReason::ReadinessExited),
+        StartupFailure::ExitedCudaInit => (false, TrialFailureReason::ReadinessExitedCudaInit),
         StartupFailure::TimedOut => (false, TrialFailureReason::ReadinessTimeout),
     };
     Trial {
@@ -602,10 +603,33 @@ pub fn sample_variance(samples: &[f64]) -> Option<f64> {
     Some(spread / mean)
 }
 
+/// Memory the host can still commit, in bytes.
+///
+/// Windows has a hard commit limit (RAM plus page file), and sysinfo reports
+/// its free part as free swap. Elsewhere there is no such limit — the kernel
+/// can hand out available RAM plus free swap before it runs out.
+#[must_use]
+pub fn commit_headroom_bytes(windows: bool, available_ram: u64, free_swap: u64) -> u64 {
+    if windows {
+        free_swap
+    } else {
+        available_ram.saturating_add(free_swap)
+    }
+}
+
+/// [`commit_headroom_bytes`] for this host, in GB, from a system whose memory
+/// was just refreshed. `0.0` when sysinfo reports nothing.
+#[must_use]
+pub fn host_commit_headroom_gb(system: &sysinfo::System) -> f64 {
+    commit_headroom_bytes(cfg!(windows), system.available_memory(), system.free_swap()) as f64
+        / 1_073_741_824.0
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ResourceSample {
     cpu_pct: Option<f64>,
     ram_available_gb: Option<f64>,
+    commit_available_gb: Option<f64>,
     gpu_vram_free_gb: Option<f64>,
     gpu_vram_total_gb: Option<f64>,
 }
@@ -615,6 +639,7 @@ struct TelemetryAccumulator {
     cpu_sum: f64,
     cpu_samples: u32,
     ram_available_gb_min: Option<f64>,
+    commit_available_gb_min: Option<f64>,
     gpu_vram_free_gb: Vec<f64>,
     gpu_vram_total_gb: Option<f64>,
 }
@@ -632,6 +657,15 @@ impl TelemetryAccumulator {
             self.ram_available_gb_min = Some(
                 self.ram_available_gb_min
                     .map_or(ram, |current| current.min(ram)),
+            );
+        }
+        if let Some(commit) = sample
+            .commit_available_gb
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            self.commit_available_gb_min = Some(
+                self.commit_available_gb_min
+                    .map_or(commit, |current| current.min(commit)),
             );
         }
         if let Some(free) = sample
@@ -678,6 +712,7 @@ impl TelemetryAccumulator {
             gpu_vram_free_gb_std,
             gpu_vram_free_gb_samples,
             gpu_vram_total_gb: self.gpu_vram_total_gb,
+            commit_available_gb_min: self.commit_available_gb_min,
         }
     }
 }
@@ -715,6 +750,7 @@ impl HostResourceProbe {
         ResourceSample {
             cpu_pct,
             ram_available_gb: Some(self.system.available_memory() as f64 / 1_073_741_824.0),
+            commit_available_gb: Some(host_commit_headroom_gb(&self.system)),
             gpu_vram_free_gb,
             gpu_vram_total_gb,
         }
@@ -936,15 +972,15 @@ impl LiveRunner<'_> {
             StartupOutcome::Exited { oom, status } => {
                 // Already exited — reaping is a no-op wait, never an error.
                 let _ = child.wait();
-                startup_failed_trial(
-                    if oom {
-                        StartupFailure::ExitedOom
-                    } else {
-                        StartupFailure::Exited
-                    },
-                    status,
-                    sanitize_excerpt(&self.log_tail(log)),
-                )
+                let log_tail = self.log_tail(log);
+                let failure = if oom {
+                    StartupFailure::ExitedOom
+                } else if is_cuda_init_failure(&log_tail) {
+                    StartupFailure::ExitedCudaInit
+                } else {
+                    StartupFailure::Exited
+                };
+                startup_failed_trial(failure, status, sanitize_excerpt(&log_tail))
             }
             StartupOutcome::TimedOut => {
                 let _ = child.kill();
@@ -1690,12 +1726,14 @@ mod tests {
         accumulator.record(ResourceSample {
             cpu_pct: Some(50.0),
             ram_available_gb: Some(16.0),
+            commit_available_gb: None,
             gpu_vram_free_gb: Some(3.0),
             gpu_vram_total_gb: Some(24.0),
         });
         accumulator.record(ResourceSample {
             cpu_pct: Some(60.0),
             ram_available_gb: Some(15.0),
+            commit_available_gb: None,
             gpu_vram_free_gb: None,
             gpu_vram_total_gb: None,
         });
@@ -1726,12 +1764,14 @@ mod tests {
         accumulator.record(ResourceSample {
             cpu_pct: Some(80.0),
             ram_available_gb: Some(12.0),
+            commit_available_gb: None,
             gpu_vram_free_gb: Some(2.0),
             gpu_vram_total_gb: Some(24.0),
         });
         accumulator.record(ResourceSample {
             cpu_pct: Some(100.0),
             ram_available_gb: Some(8.0),
+            commit_available_gb: None,
             gpu_vram_free_gb: Some(1.0),
             gpu_vram_total_gb: Some(24.0),
         });
@@ -2119,6 +2159,91 @@ mod tests {
         );
         #[cfg(not(windows))]
         return ("sleep", vec!["4".to_string()]);
+    }
+
+    /// Exits after printing the CUDA line llama.cpp logged when the host ran
+    /// out of commit during a no-mmap load.
+    fn cuda_init_exit_command() -> (&'static str, Vec<String>) {
+        #[cfg(windows)]
+        return (
+            "cmd",
+            vec![
+                "/c".to_string(),
+                "echo CUDA error: shared object initialization failed & exit 1".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        return (
+            "sh",
+            vec![
+                "-c".to_string(),
+                "echo 'CUDA error: shared object initialization failed'; exit 1".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_initialise_cuda_is_not_reported_as_out_of_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("trial.log");
+        let (prog, args) = cuda_init_exit_command();
+        let mut child = spawn_detached(prog, &args, None, Some(&log)).unwrap();
+
+        let live = live_runner(&NeverReadyLauncher, dir.path().to_path_buf(), 30);
+        let trial = live.measure_spawned(&mut child, 1, &log);
+
+        assert!(!trial.startup_ok);
+        assert!(!trial.oom, "a CUDA init failure is not VRAM evidence");
+        assert_eq!(trial.startup_failure, Some(StartupFailure::ExitedCudaInit));
+        assert_eq!(
+            trial.failure.as_ref().map(TrialFailure::summary).as_deref(),
+            Some("readiness/readiness_exited_cuda_init")
+        );
+    }
+
+    #[test]
+    fn commit_headroom_is_the_page_file_limit_on_windows_and_ram_plus_swap_elsewhere() {
+        let gib = 1_073_741_824_u64;
+        assert_eq!(commit_headroom_bytes(true, 40 * gib, 12 * gib), 12 * gib);
+        assert_eq!(commit_headroom_bytes(false, 40 * gib, 12 * gib), 52 * gib);
+        assert_eq!(commit_headroom_bytes(false, u64::MAX, 1), u64::MAX);
+    }
+
+    /// Live check: prints this host's commit headroom so it can be compared
+    /// with the OS's own counters (on Windows: Commit Limit − Committed Bytes).
+    #[test]
+    #[ignore = "reads the real host"]
+    fn prints_this_hosts_commit_headroom() {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let gib = 1_073_741_824.0;
+        println!(
+            "commit headroom: {:.2} GiB (total {:.2}, available {:.2}, swap total {:.2}, swap used {:.2})",
+            host_commit_headroom_gb(&system),
+            system.total_memory() as f64 / gib,
+            system.available_memory() as f64 / gib,
+            system.total_swap() as f64 / gib,
+            system.used_swap() as f64 / gib
+        );
+    }
+
+    #[test]
+    fn telemetry_keeps_the_lowest_commit_headroom_seen() {
+        let mut accumulator = TelemetryAccumulator::default();
+        for commit in [Some(30.0), None, Some(12.5), Some(0.0), Some(20.0)] {
+            accumulator.record(ResourceSample {
+                commit_available_gb: commit,
+                ..ResourceSample::default()
+            });
+        }
+        let telemetry = accumulator.finish();
+        // A zero reading means sysinfo had nothing, not that commit ran out.
+        assert_eq!(telemetry.commit_available_gb_min, Some(12.5));
+        assert!(
+            !localbench_scoring::score::BALANCED_TELEMETRY_FIELDS
+                .contains(&"commit_available_gb_min"),
+            "commit headroom is recorded evidence, not a scoring input"
+        );
     }
 
     #[test]

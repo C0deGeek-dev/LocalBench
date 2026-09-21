@@ -4,6 +4,20 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **A memory flag the host cannot honour is no longer tried.** `NoMmap` and
+  `Mlock` were offered on free RAM alone. On Windows the limit that actually
+  fails is commit — RAM plus the page file — and the GPU driver charges its own
+  device memory against it, so a large MoE at a long context could pass the RAM
+  check and still die at CUDA initialisation, which reads like an unexplained
+  startup failure and costs a trial each time. Four trials went that way during
+  the Flash-Next tune, with commit at 80.1 of 80.8 GB. Locking is still gated on
+  RAM, loading without mmap is now gated on commit headroom including the GPU's
+  host-side shadow, and a candidate that cannot fit says which limit stopped it
+  and by how much. A `CUDA error: shared object initialization failed` at
+  startup is now read as the memory evidence it is. The verify trial records the
+  smallest commit headroom it saw, so a winner that ran the host to its limit is
+  visible in the saved trial.
+
 - **A lighter memory shape gets more of the model on the GPU.** Later phases
   moved a candidate's placement only toward the CPU (when its shape needed
   more memory), never back. A dense 27B model at 256k with a `q8_0` cache fits

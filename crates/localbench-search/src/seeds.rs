@@ -14,6 +14,16 @@ pub struct HostFacts {
     pub logical_cores: u32,
     pub available_ram_gb: f64,
     pub gguf_size_gb: f64,
+    /// Memory the host can still commit — RAM plus page file on Windows, RAM
+    /// plus free swap elsewhere — before the server starts. `0` = unknown.
+    pub commit_available_gb: f64,
+    /// Model bytes the build keeps memory-mapped even when it loads the model
+    /// without mmap (a per-layer embedding table it reads on demand), so they
+    /// never become private memory.
+    pub lazy_mapped_gb: f64,
+    /// Whether the GPU driver backs device memory with host commit (Windows
+    /// WDDM), so the part of the model on the GPU also counts against commit.
+    pub vram_backed_by_host_commit: bool,
 }
 
 /// How VRAM-constrained the run looks.
@@ -25,11 +35,28 @@ pub enum VramRisk {
     Normal,
 }
 
+/// Why a memory-pinning candidate is not tried on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "limit", rename_all = "snake_case")]
+pub enum PinningLimit {
+    /// Less free RAM than the candidate needs to spare.
+    Ram { needed_gb: f64, available_gb: f64 },
+    /// Loading the model without mmap would commit more memory (RAM plus page
+    /// file or swap) than the host has free.
+    Commit { needed_gb: f64, available_gb: f64 },
+}
+
 /// The memory-mapping recommendation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MmapRecommendation {
     pub mlock: bool,
     pub no_mmap: bool,
+    /// Why `mlock` is withheld, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlock_limit: Option<PinningLimit>,
+    /// Why `no_mmap` is withheld, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_mmap_limit: Option<PinningLimit>,
 }
 
 /// The seeded starting candidates per axis.
@@ -57,6 +84,8 @@ impl Default for SmartSeeds {
             mmap_recommendation: MmapRecommendation {
                 mlock: true,
                 no_mmap: true,
+                mlock_limit: None,
+                no_mmap_limit: None,
             },
             vram_risk: VramRisk::Normal,
             assumptions: Vec::new(),
@@ -132,6 +161,13 @@ pub fn resolve_smart_seeds(space: &SearchSpace, host: HostFacts, profile: Profil
     if host.gguf_size_gb > 0.0 {
         assumptions.push(format!("GGUF size {:.1}GB", host.gguf_size_gb));
     }
+    if host.commit_available_gb > 0.0 {
+        assumptions.push(format!(
+            "commit headroom {:.1}GB (loading without mmap needs ~{:.1}GB)",
+            host.commit_available_gb,
+            no_mmap_commit_gb(host)
+        ));
+    }
     if space.is_moe {
         assumptions.push(format!(
             "MoE expert CPU-offload boundary near NCpuMoe={}",
@@ -153,24 +189,67 @@ pub fn resolve_smart_seeds(space: &SearchSpace, host: HostFacts, profile: Profil
 }
 
 /// RAM a host must keep free, beyond what it pins, before the tuner tries
-/// loading the model into RAM (`NoMmap`) or locking it there (`Mlock`).
+/// loading the model into RAM (`NoMmap`) or locking it there (`Mlock`). The
+/// same margin is kept on commit headroom.
 const PINNING_HEADROOM_GB: f64 = 8.0;
+
+/// Memory a load without mmap commits for the model's weights, in GB.
+///
+/// Without mmap the weights become private memory, except the tensors the
+/// build keeps mapped anyway (a lazily read per-layer embedding table). The
+/// part on the GPU is not private host memory — unless the GPU driver backs
+/// device memory with host commit (Windows WDDM), where the whole non-mapped
+/// model counts: the CPU part as private pages, the GPU part as the driver's
+/// backing. The model's size is the best estimate before placement is known.
+#[must_use]
+pub fn no_mmap_commit_gb(host: HostFacts) -> f64 {
+    let size = host.gguf_size_gb.max(0.0);
+    let private = size - host.lazy_mapped_gb.clamp(0.0, size);
+    let on_gpu = if host.vram_backed_by_host_commit {
+        0.0
+    } else {
+        f64::from(host.vram_gb)
+    };
+    (private - on_gpu).max(0.0)
+}
 
 /// Which memory-pinning candidates are worth measuring on this host.
 ///
-/// Loading without mmap needs working room; locking holds the whole model in
-/// RAM, so it is only tried when the full GGUF (every shard) fits beside the
-/// headroom. Unknown RAM or size keeps the candidate: the trial itself is the
+/// Loading without mmap needs working room in RAM and enough commit headroom
+/// for the weights it makes private; locking holds the whole model in RAM, so
+/// it is only tried when the full GGUF (every shard) fits beside the headroom.
+/// Unknown RAM, commit, or size keeps the candidate: the trial itself is the
 /// evidence.
 fn mmap_recommendation(host: HostFacts) -> MmapRecommendation {
     let ram_known = host.available_ram_gb > 0.0;
-    let no_mmap = !ram_known || host.available_ram_gb >= PINNING_HEADROOM_GB;
-    let model_fits = !ram_known
-        || host.gguf_size_gb <= 0.0
-        || host.available_ram_gb >= host.gguf_size_gb + PINNING_HEADROOM_GB;
+    let size_known = host.gguf_size_gb > 0.0;
+    let ram_limit =
+        (ram_known && host.available_ram_gb < PINNING_HEADROOM_GB).then_some(PinningLimit::Ram {
+            needed_gb: PINNING_HEADROOM_GB,
+            available_gb: host.available_ram_gb,
+        });
+    let commit_needed = no_mmap_commit_gb(host) + PINNING_HEADROOM_GB;
+    let commit_limit =
+        (host.commit_available_gb > 0.0 && size_known && host.commit_available_gb < commit_needed)
+            .then_some(PinningLimit::Commit {
+                needed_gb: commit_needed,
+                available_gb: host.commit_available_gb,
+            });
+    let lock_needed = host.gguf_size_gb + PINNING_HEADROOM_GB;
+    let lock_limit = ram_limit.or_else(|| {
+        (ram_known && size_known && host.available_ram_gb < lock_needed).then_some(
+            PinningLimit::Ram {
+                needed_gb: lock_needed,
+                available_gb: host.available_ram_gb,
+            },
+        )
+    });
+    let no_mmap_limit = ram_limit.or(commit_limit);
     MmapRecommendation {
-        mlock: no_mmap && model_fits,
-        no_mmap,
+        mlock: lock_limit.is_none(),
+        no_mmap: no_mmap_limit.is_none(),
+        mlock_limit: lock_limit,
+        no_mmap_limit,
     }
 }
 
@@ -301,6 +380,100 @@ mod tests {
         );
         assert!(small.mmap_recommendation.mlock);
         assert!(small.mmap_recommendation.no_mmap);
+    }
+
+    /// The live Flash-Next case: a 105.6 GB model whose 50.7 GB per-layer
+    /// embedding table stays mapped, on a 24 GB Windows card.
+    fn flash_next(commit_available_gb: f64, windows: bool) -> HostFacts {
+        HostFacts {
+            vram_gb: 24,
+            logical_cores: 32,
+            available_ram_gb: 58.0,
+            gguf_size_gb: 105.6,
+            commit_available_gb,
+            lazy_mapped_gb: 50.7,
+            vram_backed_by_host_commit: windows,
+        }
+    }
+
+    #[test]
+    fn loading_without_mmap_needs_commit_for_everything_not_mapped() {
+        // Windows: the GPU part is backed by host commit, so the whole
+        // non-mapped model (54.9 GB) counts.
+        assert!((no_mmap_commit_gb(flash_next(0.0, true)) - 54.9).abs() < 1e-9);
+        // Elsewhere only the part that cannot sit on the GPU is private.
+        assert!((no_mmap_commit_gb(flash_next(0.0, false)) - 30.9).abs() < 1e-9);
+        // Nothing read lazily: the whole file.
+        let eager = HostFacts {
+            lazy_mapped_gb: 0.0,
+            ..flash_next(0.0, true)
+        };
+        assert!((no_mmap_commit_gb(eager) - 105.6).abs() < 1e-9);
+        // A model that fits the card commits nothing extra off Windows.
+        let small = HostFacts {
+            gguf_size_gb: 16.0,
+            lazy_mapped_gb: 0.0,
+            ..flash_next(0.0, false)
+        };
+        assert_eq!(no_mmap_commit_gb(small), 0.0);
+    }
+
+    #[test]
+    fn a_host_without_the_commit_headroom_is_not_offered_no_mmap() {
+        let space = moe_space(35);
+        // The failing live host: ~55 GB of commit left before the server
+        // started, while loading without mmap needs 54.9 GB plus the margin.
+        let tight = resolve_smart_seeds(&space, flash_next(55.0, true), Profile::Pure);
+        assert!(!tight.mmap_recommendation.no_mmap);
+        let Some(PinningLimit::Commit {
+            needed_gb,
+            available_gb,
+        }) = tight.mmap_recommendation.no_mmap_limit
+        else {
+            panic!("{:?}", tight.mmap_recommendation);
+        };
+        assert!((needed_gb - (54.9 + PINNING_HEADROOM_GB)).abs() < 1e-9);
+        assert_eq!(available_gb, 55.0);
+        // Locking is a RAM question: the whole model does not fit in 58 GB.
+        assert!(!tight.mmap_recommendation.mlock);
+        assert!(matches!(
+            tight.mmap_recommendation.mlock_limit,
+            Some(PinningLimit::Ram { .. })
+        ));
+        assert!(tight
+            .assumptions
+            .iter()
+            .any(|a| a == "commit headroom 55.0GB (loading without mmap needs ~54.9GB)"));
+
+        // A 128 GB page file leaves room.
+        let roomy = resolve_smart_seeds(&space, flash_next(150.0, true), Profile::Pure);
+        assert!(roomy.mmap_recommendation.no_mmap);
+        assert_eq!(roomy.mmap_recommendation.no_mmap_limit, None);
+        // The same headroom suffices off Windows, where the GPU part is not committed.
+        let linux = resolve_smart_seeds(&space, flash_next(55.0, false), Profile::Pure);
+        assert!(linux.mmap_recommendation.no_mmap);
+        // Unknown commit keeps the candidate: the trial is the evidence.
+        let unknown = resolve_smart_seeds(&space, flash_next(0.0, true), Profile::Pure);
+        assert!(unknown.mmap_recommendation.no_mmap);
+    }
+
+    #[test]
+    fn locking_a_mapped_model_needs_ram_not_commit() {
+        let space = moe_space(35);
+        // A 22.8 GB model on a host with RAM to spare but almost no commit:
+        // loading it privately is out, locking the mapped file is not.
+        let host = HostFacts {
+            vram_gb: 24,
+            logical_cores: 16,
+            available_ram_gb: 40.0,
+            gguf_size_gb: 22.8,
+            commit_available_gb: 20.0,
+            lazy_mapped_gb: 0.0,
+            vram_backed_by_host_commit: true,
+        };
+        let seeds = resolve_smart_seeds(&space, host, Profile::Pure);
+        assert!(seeds.mmap_recommendation.mlock);
+        assert!(!seeds.mmap_recommendation.no_mmap);
     }
 
     #[test]

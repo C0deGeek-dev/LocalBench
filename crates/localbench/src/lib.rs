@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod coach;
+pub mod commit;
 pub mod consumer;
 pub mod diagnostics;
 pub mod export;

@@ -66,6 +66,9 @@ pub enum StartupFailure {
     ExitedOom,
     /// The server process exited during startup with no OOM signature.
     Exited,
+    /// The server process exited while initialising CUDA, most often because
+    /// the host ran out of commit (RAM plus page file) — not VRAM.
+    ExitedCudaInit,
     /// The server process was still running but never answered within the budget.
     TimedOut,
 }
@@ -96,6 +99,7 @@ pub enum TrialFailureReason {
     BinaryUnavailable,
     SpawnFailed,
     ReadinessExitedOom,
+    ReadinessExitedCudaInit,
     ReadinessExited,
     ReadinessTimeout,
     Transport,
@@ -268,6 +272,12 @@ pub struct Telemetry {
     pub gpu_vram_free_gb_samples: Option<u32>,
     /// Total VRAM on the card (GB).
     pub gpu_vram_total_gb: Option<f64>,
+    /// Minimum commit headroom observed (GB): memory the host could still
+    /// commit — RAM plus page file on Windows, RAM plus free swap elsewhere.
+    /// Recorded evidence, not a scoring input: a winner that runs the host to
+    /// its commit limit is visible here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_available_gb_min: Option<f64>,
 }
 
 /// Telemetry inputs consumed by [`balanced_score`]. The live producer tests
@@ -1134,6 +1144,7 @@ mod tests {
             gpu_vram_free_gb_std: Some(0.0),
             gpu_vram_free_gb_samples: Some(4),
             gpu_vram_total_gb: Some(24.0),
+            commit_available_gb_min: None,
         };
         let fast_but_hot = Trial {
             startup_ok: true,

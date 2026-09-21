@@ -283,6 +283,36 @@ fn memory_flag_overlays(
     overlays
 }
 
+/// Why the memory-flags phase leaves out `Mlock` or `NoMmap` on this host.
+fn pinning_limit_notes(
+    recommendation: localbench_search::seeds::MmapRecommendation,
+) -> Vec<String> {
+    use localbench_search::seeds::PinningLimit;
+    let describe = |limit: PinningLimit| {
+        match limit {
+        PinningLimit::Ram {
+            needed_gb,
+            available_gb,
+        } => format!("needs {needed_gb:.1}GB of free RAM, the host has {available_gb:.1}GB"),
+        PinningLimit::Commit {
+            needed_gb,
+            available_gb,
+        } => format!(
+            "loading the model into RAM would commit ~{needed_gb:.1}GB (RAM plus page file or swap), the host has {available_gb:.1}GB free"
+        ),
+    }
+    };
+    [
+        ("Mlock", recommendation.mlock_limit),
+        ("NoMmap", recommendation.no_mmap_limit),
+    ]
+    .into_iter()
+    .filter_map(|(flag, limit)| {
+        limit.map(|limit| format!("memory-flags: {flag} not tried — {}", describe(limit)))
+    })
+    .collect()
+}
+
 /// One progress line describing the oracle's placement.
 fn oracle_note(fit: &FitPlacement, is_moe: bool) -> String {
     let device = fit
@@ -1002,10 +1032,13 @@ pub fn run_tuner_with(
     ];
     for (phase, overlays) in flag_phases {
         events(format!("phase: {phase}"));
+        if phase == "memory-flags" {
+            for line in pinning_limit_notes(seeds.mmap_recommendation) {
+                events(line);
+            }
+        }
         if overlays.is_empty() {
-            events(format!(
-                "{phase}: skipped — not enough free RAM to load or lock this model in memory"
-            ));
+            events(format!("{phase}: skipped — nothing this host can hold"));
             continue;
         }
         let beam = beam_so_far(&history);
@@ -1324,6 +1357,7 @@ mod tests {
                 logical_cores: 16,
                 available_ram_gb: 64.0,
                 gguf_size_gb: 21.0,
+                ..localbench_search::seeds::HostFacts::default()
             },
             Profile::Pure,
         )
@@ -2187,6 +2221,7 @@ mod tests {
                 logical_cores: 16,
                 available_ram_gb: 64.0,
                 gguf_size_gb: 12.0,
+                ..localbench_search::seeds::HostFacts::default()
             },
             Profile::Pure,
         );
@@ -2267,6 +2302,7 @@ mod tests {
                 logical_cores: 16,
                 available_ram_gb: 64.0,
                 gguf_size_gb: 12.0,
+                ..localbench_search::seeds::HostFacts::default()
             },
             Profile::Pure,
         );
@@ -2300,6 +2336,8 @@ mod tests {
         let all = memory_flag_overlays(MmapRecommendation {
             mlock: true,
             no_mmap: true,
+            mlock_limit: None,
+            no_mmap_limit: None,
         });
         assert_eq!(
             keys(all),
@@ -2312,13 +2350,41 @@ mod tests {
         let no_lock = memory_flag_overlays(MmapRecommendation {
             mlock: false,
             no_mmap: true,
+            mlock_limit: None,
+            no_mmap_limit: None,
         });
         assert_eq!(keys(no_lock), vec![vec!["NoMmap".to_string()]]);
         assert!(memory_flag_overlays(MmapRecommendation {
             mlock: false,
             no_mmap: false,
+            mlock_limit: None,
+            no_mmap_limit: None,
         })
         .is_empty());
+    }
+
+    #[test]
+    fn a_withheld_memory_flag_says_which_limit_held_it_back() {
+        use localbench_search::seeds::{MmapRecommendation, PinningLimit};
+        let notes = pinning_limit_notes(MmapRecommendation {
+            mlock: false,
+            no_mmap: false,
+            mlock_limit: Some(PinningLimit::Ram {
+                needed_gb: 113.6,
+                available_gb: 58.0,
+            }),
+            no_mmap_limit: Some(PinningLimit::Commit {
+                needed_gb: 62.9,
+                available_gb: 55.0,
+            }),
+        });
+        assert_eq!(
+            notes,
+            vec![
+                "memory-flags: Mlock not tried — needs 113.6GB of free RAM, the host has 58.0GB",
+                "memory-flags: NoMmap not tried — loading the model into RAM would commit ~62.9GB (RAM plus page file or swap), the host has 55.0GB free",
+            ]
+        );
     }
 
     /// A host whose real VRAM edge depends on the KV type: MoE configs need at

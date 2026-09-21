@@ -157,9 +157,17 @@ so a phase measuring nothing is never silent.
    way the build under test accepts it: `--load-mode mmap+mlock` / `none` /
    `mlock` on builds that list `--load-mode` (current mainline, prism), the
    legacy `--mlock` / `--no-mmap` on builds that do not (turboquant). The
-   candidates follow your free RAM: loading into RAM needs working room, and
-   locking is only tried when the whole model — every shard of a split GGUF —
-   fits beside it. With too little RAM the phase is skipped and says so.
+   candidates follow what the host can actually give them, which is two
+   different limits. Locking needs free **RAM**: the whole model — every shard
+   of a split GGUF — has to fit beside working room. Loading without mmap needs
+   **commit**, which on Windows is a hard ceiling of RAM plus the page file, and
+   the GPU driver charges its own device memory against it too (about 22 GB of
+   host commit for a 24 GB card under WDDM), so the part of the model on the GPU
+   counts as well. A candidate that cannot commit is never tried, and the phase
+   says which limit stopped it and by how much rather than spending a trial to
+   discover it — a `NoMmap` launch past the commit limit dies at CUDA
+   initialisation, which reads like an unexplained startup failure. If yours
+   does, a larger page file is the remedy.
 7. **cache-flags** — default SWA/cache behaviour vs `--swa-full`,
    `--cache-prompt`, and both together with `CacheReuse=256`.
 8. **threads** — CPU thread sweep, only when the current best actually keeps
@@ -249,12 +257,17 @@ the run-to-run decode variance feeds the stability scoring.
 
   > The free-VRAM / free-RAM / CPU-load headroom factors activate only when the
   > runner samples host telemetry during trials. The live server runner does not
-  > yet collect it, so a **live** `balanced` run is discounted by within-run
+  > yet collect those, so a **live** `balanced` run is discounted by within-run
   > throughput variance and by the **cross-phase stability factor** — the
   > stability index is rebuilt from the run's own trial history at the final
   > ranking, so a config that measured fast in one phase and slow in another
   > is penalized as documented. The richer headroom factors are exercised by
   > the scoring tests.
+  >
+  > One host fact *is* recorded live: the smallest commit headroom seen during a
+  > trial (`commit_available_gb_min`). It is evidence, not a scoring input — a
+  > winner that ran the host to its commit limit is visible in the saved trial
+  > rather than having to be rediscovered on the next launch.
 
 `--profile both` ranks the same measured candidates by the **better of** the
 pure and balanced score and exports that single winning entry (it is a
