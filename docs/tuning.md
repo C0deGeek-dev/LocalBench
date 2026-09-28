@@ -37,7 +37,12 @@ first — through the launcher library's own resumable fetch, the same download 
 LocalBox launch performs (`.partial` sidecar, same Hugging Face URL) — with
 coarse progress on stderr, so a model straight from the catalog can be tuned
 without launching it once. Only the GGUF is fetched; a configured vision
-projector or draft model is never pulled by a tuning run.
+projector or draft model is never pulled by a tuning run. A split GGUF counts
+as on disk only when every shard is: a finished first shard with a later one
+missing is completed before the first trial. If a trial still shows that
+llama.cpp cannot read the model file (a missing shard, or a truncated or
+corrupt file), the run stops at that trial instead of treating it as memory
+pressure — every candidate loads the same file.
 
 LocalBench honors the catalog's required engine. For example, `tbonsai27b`
 selects the PrismML build automatically; `--mode prism` is accepted explicitly,

@@ -4,6 +4,16 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **A split model with a missing shard is completed, not tuned.** The
+  pre-flight download looked only at the first shard of a split GGUF, so a
+  Flash-Next coder whose second shard never downloaded went straight into a
+  tune. Every trial then died loading the model, and the startup recovery
+  ladder read that as memory pressure: eleven trials climbed `NCpuMoe` from 35
+  to 45 before the run gave up. `findbest` now downloads every missing shard
+  first, and a trial whose server cannot read the model file (missing shard,
+  truncated or corrupt GGUF) is reported as `readiness_exited_model_file` and
+  stops the run at once with a line saying so.
+
 - **An axis the catalog pins is no longer "searched".** A model's `ExtraArgs`
   land after every candidate value on the server command line, and llama.cpp
   keeps the last occurrence of a flag. The Flash-Next entry carried

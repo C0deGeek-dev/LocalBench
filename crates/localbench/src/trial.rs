@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use localbench_measure::cache::stable_json_hash;
 use localbench_measure::classify::{
-    is_cuda_init_failure, is_oom_message, output_quality_ok, QUALITY_MIN_CHARS, QUALITY_MIN_WORDS,
+    is_cuda_init_failure, is_model_file_failure, is_oom_message, output_quality_ok,
+    QUALITY_MIN_CHARS, QUALITY_MIN_WORDS,
 };
 use localbench_measure::prompt::coding_agent_stress_prompt;
 use localbench_scoring::score::Overrides;
@@ -565,6 +566,7 @@ fn startup_failed_trial(
         StartupFailure::ExitedOom => (true, TrialFailureReason::ReadinessExitedOom),
         StartupFailure::Exited => (false, TrialFailureReason::ReadinessExited),
         StartupFailure::ExitedCudaInit => (false, TrialFailureReason::ReadinessExitedCudaInit),
+        StartupFailure::ExitedModelFile => (false, TrialFailureReason::ReadinessExitedModelFile),
         StartupFailure::TimedOut => (false, TrialFailureReason::ReadinessTimeout),
     };
     Trial {
@@ -973,7 +975,11 @@ impl LiveRunner<'_> {
                 // Already exited — reaping is a no-op wait, never an error.
                 let _ = child.wait();
                 let log_tail = self.log_tail(log);
-                let failure = if oom {
+                // An unreadable model file comes first: llama.cpp's fitter
+                // reports it too, and no placement change can fix it.
+                let failure = if is_model_file_failure(&log_tail) {
+                    StartupFailure::ExitedModelFile
+                } else if oom {
                     StartupFailure::ExitedOom
                 } else if is_cuda_init_failure(&log_tail) {
                     StartupFailure::ExitedCudaInit
@@ -2190,6 +2196,49 @@ mod tests {
             trial.failure.as_ref().map(TrialFailure::summary).as_deref(),
             Some("readiness/readiness_exited_cuda_init")
         );
+    }
+
+    /// Exits after printing the lines llama.cpp logged for a split GGUF whose
+    /// second shard was missing, followed by an allocation line so the
+    /// model-file diagnosis has to win over the OOM one.
+    fn missing_shard_exit_command() -> (&'static str, Vec<String>) {
+        #[cfg(windows)]
+        return (
+            "cmd",
+            vec![
+                "/c".to_string(),
+                "echo gguf_init_from_file: failed to open GGUF file m-00002-of-00002.gguf & echo failed to allocate & exit 1".to_string(),
+            ],
+        );
+        #[cfg(not(windows))]
+        return (
+            "sh",
+            vec![
+                "-c".to_string(),
+                "echo 'gguf_init_from_file: failed to open GGUF file m-00002-of-00002.gguf'; echo 'failed to allocate'; exit 1".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_read_the_model_file_is_neither_oom_nor_memory_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("trial.log");
+        let (prog, args) = missing_shard_exit_command();
+        let mut child = spawn_detached(prog, &args, None, Some(&log)).unwrap();
+
+        let live = live_runner(&NeverReadyLauncher, dir.path().to_path_buf(), 30);
+        let trial = live.measure_spawned(&mut child, 1, &log);
+
+        assert!(!trial.startup_ok);
+        assert!(!trial.oom, "a missing shard is not VRAM evidence");
+        assert_eq!(trial.startup_failure, Some(StartupFailure::ExitedModelFile));
+        assert_eq!(
+            trial.failure.as_ref().map(TrialFailure::summary).as_deref(),
+            Some("readiness/readiness_exited_model_file")
+        );
+        assert!(trial.model_file_unreadable());
+        assert!(!trial.needs_memory_recovery());
     }
 
     #[test]

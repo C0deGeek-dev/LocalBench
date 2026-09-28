@@ -69,6 +69,10 @@ pub enum StartupFailure {
     /// The server process exited while initialising CUDA, most often because
     /// the host ran out of commit (RAM plus page file) — not VRAM.
     ExitedCudaInit,
+    /// The server process exited because it could not read the model file — a
+    /// missing shard of a split GGUF, or a truncated or corrupt one. Every
+    /// configuration loads the same file, so no other candidate can succeed.
+    ExitedModelFile,
     /// The server process was still running but never answered within the budget.
     TimedOut,
 }
@@ -100,6 +104,7 @@ pub enum TrialFailureReason {
     SpawnFailed,
     ReadinessExitedOom,
     ReadinessExitedCudaInit,
+    ReadinessExitedModelFile,
     ReadinessExited,
     ReadinessTimeout,
     Transport,
@@ -230,10 +235,20 @@ impl Trial {
     #[must_use]
     pub fn needs_memory_recovery(&self) -> bool {
         self.oom
-            || self
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.stage == TrialFailureStage::Readiness)
+            || (!self.model_file_unreadable()
+                && self
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.stage == TrialFailureStage::Readiness))
+    }
+
+    /// Whether the server could not read the model file itself. No placement,
+    /// cache, or flag change can fix that, so it is never memory evidence.
+    #[must_use]
+    pub fn model_file_unreadable(&self) -> bool {
+        self.failure
+            .as_ref()
+            .is_some_and(|failure| failure.reason == TrialFailureReason::ReadinessExitedModelFile)
     }
 
     /// Whether a different KV cache pair could plausibly fix this trial: the

@@ -499,6 +499,9 @@ pub fn run_tuner_with(
     // Shared by the measure step (which sets it) and the screen (which must
     // not rank candidates a phase has no trials left to measure).
     let phase_gate: std::cell::RefCell<Option<PhaseGate>> = std::cell::RefCell::new(None);
+    // Set once a trial shows llama.cpp cannot read the model file. Every
+    // candidate loads the same file, so nothing after that is measured.
+    let model_file_unreadable = std::cell::Cell::new(false);
 
     // ----- Phase 1 setup: the baseline, placed by the oracle when there is one -----
     let mut baseline = overrides_of(&[
@@ -642,6 +645,9 @@ pub fn run_tuner_with(
                        seen: &mut BTreeSet<String>,
                        events: &mut dyn FnMut(String)|
      -> Option<Candidate> {
+        if model_file_unreadable.get() {
+            return None;
+        }
         // Keep the verification ladder's slots for the fresh measurement.
         if *trials as i64 >= search_budget {
             return None;
@@ -725,6 +731,13 @@ pub fn run_tuner_with(
             signature,
             trial_summary(&trial, candidate.selected_score)
         ));
+        if trial.model_file_unreadable() {
+            model_file_unreadable.set(true);
+            events(
+                "stopped: llama.cpp could not read the model file (a missing shard of a split GGUF, or a truncated or corrupt one) — every candidate loads the same file, so no configuration can start; download the model again and retune"
+                    .to_string(),
+            );
+        }
         history.push(candidate.clone());
         Some(candidate)
     };
@@ -747,6 +760,9 @@ pub fn run_tuner_with(
     let baseline_needs_kv_recovery =
         !baseline_usable && baseline_trial.is_some_and(Trial::needs_kv_recovery);
     let baseline_seed_failed = seed_failed(baseline_candidate.as_ref());
+    if model_file_unreadable.get() {
+        return None;
+    }
     if !baseline_usable && !baseline_needs_recovery && !baseline_needs_kv_recovery {
         events(
             "stopped: baseline reached no usable measurement and supplied no startup/OOM fit evidence; fix the reported contract/content failure before retuning"
@@ -992,6 +1008,9 @@ pub fn run_tuner_with(
 
     let beam_so_far = |history: &[Candidate]| select_beam(history, beam_width, params.profile);
     let best_so_far = |history: &[Candidate]| beam_so_far(history).into_iter().next();
+    if model_file_unreadable.get() {
+        return None;
+    }
     if best_so_far(&history).is_none() {
         events(
             "stopped: the startup/OOM recovery ladder produced no usable measurement".to_string(),
@@ -1647,6 +1666,57 @@ mod tests {
             }
             assert!(outcome.trials as i64 <= 30);
         }
+    }
+
+    /// A model file llama.cpp cannot read fails every candidate the same way.
+    /// The Flash-Next coder tune with its second shard missing spent eleven
+    /// trials climbing `NCpuMoe` as if the model did not fit; the run now
+    /// stops at the first such trial and says what is wrong.
+    #[test]
+    fn an_unreadable_model_file_stops_the_run_at_the_first_trial() {
+        struct MissingShard {
+            phases: Vec<String>,
+        }
+        impl TrialRunner for MissingShard {
+            fn measure(&mut self, _overrides: &Overrides, phase: &str) -> Trial {
+                self.phases.push(phase.to_string());
+                Trial {
+                    startup_ok: false,
+                    oom: false,
+                    startup_failure: Some(
+                        localbench_scoring::score::StartupFailure::ExitedModelFile,
+                    ),
+                    failure: Some(localbench_scoring::score::TrialFailure {
+                        stage: localbench_scoring::score::TrialFailureStage::Readiness,
+                        reason:
+                            localbench_scoring::score::TrialFailureReason::ReadinessExitedModelFile,
+                        detail: String::new(),
+                    }),
+                    ..Trial::default()
+                }
+            }
+        }
+        let mut runner = MissingShard { phases: vec![] };
+        let mut events = Vec::new();
+        let outcome = run_tuner(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            &mut |line| events.push(line),
+        );
+        assert!(outcome.is_none());
+        assert_eq!(runner.phases, ["baseline"]);
+        let stops: Vec<&String> = events
+            .iter()
+            .filter(|line| line.starts_with("stopped:"))
+            .collect();
+        assert_eq!(stops.len(), 1, "{events:?}");
+        assert!(
+            stops[0].contains("could not read the model file"),
+            "{events:?}"
+        );
     }
 
     /// A phase the catalog's `ExtraArgs` pin runs no trials: every candidate

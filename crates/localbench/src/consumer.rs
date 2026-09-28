@@ -60,18 +60,36 @@ pub fn ensure_gguf_on_disk_with(
     let targets = launcher
         .model_download_targets(key, quant)
         .map_err(|e| e.to_string())?;
-    let gguf = targets
+    // A split quant is one target per shard, primary first. The server loads
+    // the primary and opens every other shard itself, so the model is on disk
+    // only when all of them are: a finished first shard with the rest missing
+    // otherwise starts a tune whose every trial dies loading the model.
+    let shards: Vec<_> = targets
         .iter()
-        .find(|target| target.kind == DownloadKind::Gguf)
+        .filter(|target| target.kind == DownloadKind::Gguf)
+        .collect();
+    let gguf = shards
+        .first()
         .ok_or_else(|| format!("{key} names no GGUF file to tune"))?;
-    if gguf.present {
+    let missing: Vec<_> = shards.iter().filter(|shard| !shard.present).collect();
+    if missing.is_empty() {
         return Ok(gguf.path.clone());
     }
-    writeln!(
-        out,
-        "GGUF not on disk — downloading {} …",
-        gguf.path.display()
-    )
+    if shards.len() == 1 {
+        writeln!(
+            out,
+            "GGUF not on disk — downloading {} …",
+            gguf.path.display()
+        )
+    } else {
+        writeln!(
+            out,
+            "GGUF not on disk — {} of {} shard(s) missing, downloading them, starting with {} …",
+            missing.len(),
+            shards.len(),
+            missing[0].path.display()
+        )
+    }
     .map_err(|e| e.to_string())?;
     let mut last_step: Option<u64> = None;
     let mut report = |progress: &DownloadProgress<'_>| {
@@ -250,6 +268,84 @@ mod tests {
         assert!(text.contains("Download complete."), "{text}");
         assert!(!folder.join("mmproj-Q8_0.gguf").exists());
         assert!(!folder.join("vis-draft.gguf").exists());
+    }
+
+    fn split_launcher(dir: &std::path::Path) -> LlamaLauncher {
+        use serde_json::{Map, Value};
+        let catalog: Map<String, Value> = serde_json::from_str(
+            r#"{
+            "Models": {
+                "split": {
+                    "Root": "split",
+                    "Repo": "owner/split-GGUF",
+                    "Quant": "iq1m",
+                    "Quants": { "iq1m": "IQ1_M/Split-IQ1_M-00001-of-00002.gguf" },
+                    "Contexts": { "": 8192 }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let settings: Map<String, Value> = serde_json::from_str(&format!(
+            r#"{{ "LlamaCppGgufRoot": {} }}"#,
+            Value::from(dir.to_str().unwrap())
+        ))
+        .unwrap();
+        let catalog =
+            localbox_launcher::catalog::Catalog::from_layers(&Map::new(), &catalog, &settings)
+                .unwrap();
+        LlamaLauncher::new(catalog, "3.1.0", dir.join("home"), 24)
+    }
+
+    #[test]
+    fn a_split_gguf_with_a_missing_shard_is_fetched_not_tuned() {
+        // The Flash-Next coder case: the first shard finished, the second
+        // never started. Tuning it would fail every trial on the missing
+        // split, so the pre-flight fetches before returning the primary.
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = split_launcher(dir.path());
+        let folder = dir.path().join("split").join("IQ1_M");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("Split-IQ1_M-00001-of-00002.gguf");
+        let second = folder.join("Split-IQ1_M-00002-of-00002.gguf");
+        std::fs::write(&first, b"one").unwrap();
+
+        let mut fetches = 0;
+        let mut fetch = |kinds: &[DownloadKind], _: &mut dyn FnMut(&DownloadProgress<'_>)| {
+            fetches += 1;
+            assert_eq!(kinds, &[DownloadKind::Gguf]);
+            std::fs::write(&second, b"two").unwrap();
+            Ok(vec![first.clone(), second.clone()])
+        };
+        let mut out = Vec::new();
+        let path =
+            ensure_gguf_on_disk_with(&launcher, "split", None, &mut out, &mut fetch).unwrap();
+
+        assert_eq!(fetches, 1);
+        assert_eq!(path, first, "the primary shard is what the server loads");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("1 of 2 shard(s) missing"), "{text}");
+        assert!(text.contains("00002-of-00002"), "{text}");
+    }
+
+    #[test]
+    fn a_complete_split_gguf_fetches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = split_launcher(dir.path());
+        let folder = dir.path().join("split").join("IQ1_M");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("Split-IQ1_M-00001-of-00002.gguf");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(folder.join("Split-IQ1_M-00002-of-00002.gguf"), b"two").unwrap();
+
+        let mut fetch = |_: &[DownloadKind], _: &mut dyn FnMut(&DownloadProgress<'_>)| {
+            panic!("a complete split model must not be fetched")
+        };
+        let mut out = Vec::new();
+        let path =
+            ensure_gguf_on_disk_with(&launcher, "split", None, &mut out, &mut fetch).unwrap();
+        assert_eq!(path, first);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
     }
 
     #[test]

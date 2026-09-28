@@ -53,6 +53,26 @@ pub fn is_cuda_init_failure(text: &str) -> bool {
         .any(|pattern| lower.contains(pattern))
 }
 
+/// llama.cpp failing to read the model file itself: a split GGUF with a
+/// shard missing, or a truncated or corrupt file. Pinned from a real failure
+/// (llama.cpp b11109, a Flash-Next split whose second shard never downloaded)
+/// and llama.cpp's own truncated-file message.
+pub const MODEL_FILE_FAILURE_PATTERNS: &[&str] = &[
+    "gguf_init_from_file: failed to open gguf file",
+    "failed to load gguf split",
+    "data is not within the file bounds",
+];
+
+/// Whether the text carries a model-file read failure (see
+/// [`MODEL_FILE_FAILURE_PATTERNS`]).
+#[must_use]
+pub fn is_model_file_failure(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    MODEL_FILE_FAILURE_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
 /// Whether the text carries an OOM/allocation-failure signature.
 #[must_use]
 pub fn is_oom_message(text: &str) -> bool {
@@ -104,6 +124,21 @@ mod tests {
         assert!(is_cuda_init_failure(log));
         assert!(!is_oom_message(log));
         assert!(!is_cuda_init_failure("CUDA error: out of memory"));
+    }
+
+    #[test]
+    fn a_missing_split_shard_is_a_model_file_failure_not_an_oom() {
+        // The real log lines from a tune whose second shard never downloaded.
+        let log = "E gguf_init_from_file: failed to open GGUF file 'C:\\gguf\\IQ1_M/M-IQ1_M-00002-of-00002.gguf' (No such file or directory)\n\
+                   E llama_model_load: error loading model: llama_model_loader: failed to load GGUF split from C:\\gguf\\IQ1_M/M-IQ1_M-00002-of-00002.gguf\n\
+                   E common_fit_params: encountered an error while trying to fit params to free device memory: failed to load model";
+        assert!(is_model_file_failure(log));
+        assert!(!is_oom_message(log));
+        assert!(is_model_file_failure(
+            "llama_model_load: error loading model: tensor 'blk.3.ffn_up_exps.weight' data is not within the file bounds"
+        ));
+        assert!(!is_model_file_failure("CUDA error: out of memory"));
+        assert!(!is_model_file_failure(""));
     }
 
     #[test]
