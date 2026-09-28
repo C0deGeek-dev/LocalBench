@@ -197,6 +197,64 @@ pub fn swa_flag_overlays() -> Vec<Overrides> {
     ]
 }
 
+/// The llama.cpp flags each tunable phase sets on the server command line.
+const PHASE_FLAGS: &[(&str, &[&str])] = &[
+    (
+        "kv-recovery",
+        &["-ctk", "--cache-type-k", "-ctv", "--cache-type-v"],
+    ),
+    ("batching", &["-b", "--batch-size", "-ub", "--ubatch-size"]),
+    ("flash-attn", &["-fa", "--flash-attn"]),
+    (
+        "memory-flags",
+        &["-lm", "--load-mode", "--mmap", "--no-mmap", "--mlock"],
+    ),
+    (
+        "cache-flags",
+        &[
+            "--swa-full",
+            "--cache-prompt",
+            "--no-cache-prompt",
+            "--cache-reuse",
+        ],
+    ),
+    ("threads", &["-t", "--threads", "-tb", "--threads-batch"]),
+    (
+        "kv-types",
+        &["-ctk", "--cache-type-k", "-ctv", "--cache-type-v"],
+    ),
+    ("spec-ngram", &["--spec-type"]),
+];
+
+/// A search phase the model's catalog `ExtraArgs` pin, with the flag that
+/// pins it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedPhase {
+    pub phase: &'static str,
+    pub flag: String,
+}
+
+/// The phases a catalog `ExtraArgs` list pins. Those arguments land after
+/// every candidate value on the server command line and llama.cpp keeps the
+/// last occurrence of a flag, so a pinned phase would only re-measure the
+/// pinned value under other names (LocalHub#200). Placement flags are not
+/// here: the launcher already hands placement back to them.
+#[must_use]
+pub fn phases_pinned_by_extra_args(extra_args: &[String]) -> Vec<PinnedPhase> {
+    PHASE_FLAGS
+        .iter()
+        .filter_map(|(phase, flags)| {
+            extra_args.iter().find_map(|arg| {
+                let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+                flags.contains(&name).then(|| PinnedPhase {
+                    phase,
+                    flag: name.to_string(),
+                })
+            })
+        })
+        .collect()
+}
+
 /// Clamp the trial budget to `[1, 100]`.
 #[must_use]
 pub fn resolve_tuner_budget(budget: i64) -> i64 {
@@ -578,6 +636,72 @@ mod tests {
             gguf_size_gb,
             ..SmartSeeds::default()
         }
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn extra_args_pin_the_phases_whose_flags_they_set() {
+        // The Flash-Next entry that ran every NoMmap and batching candidate as
+        // `-lm mmap -b 2048 -ub 512` (LocalHub#200).
+        let pinned = phases_pinned_by_extra_args(&args(&[
+            "-lm", "mmap", "-lzm", "on", "-fit", "on", "-fitt", "1536", "-b", "2048", "-ub", "512",
+            "-fa", "on",
+        ]));
+        let phases: Vec<(&str, &str)> = pinned
+            .iter()
+            .map(|pin| (pin.phase, pin.flag.as_str()))
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                ("batching", "-b"),
+                ("flash-attn", "-fa"),
+                ("memory-flags", "-lm")
+            ]
+        );
+    }
+
+    #[test]
+    fn long_spellings_and_kv_pins_cover_both_kv_phases() {
+        let pinned = phases_pinned_by_extra_args(&args(&[
+            "--cache-type-v=q4_0",
+            "--threads",
+            "12",
+            "--no-cache-prompt",
+            "--spec-type",
+            "ngram-simple",
+        ]));
+        let phases: Vec<&str> = pinned.iter().map(|pin| pin.phase).collect();
+        assert_eq!(
+            phases,
+            [
+                "kv-recovery",
+                "cache-flags",
+                "threads",
+                "kv-types",
+                "spec-ngram"
+            ]
+        );
+        assert_eq!(pinned[0].flag, "--cache-type-v");
+    }
+
+    #[test]
+    fn lazy_fit_and_placement_args_pin_no_phase() {
+        let pinned = phases_pinned_by_extra_args(&args(&[
+            "-lzm",
+            "on",
+            "-fit",
+            "on",
+            "-fitt",
+            "1536",
+            "-ot",
+            "blk\\.1\\.ffn=CPU",
+        ]));
+        assert!(pinned.is_empty(), "{pinned:?}");
+        assert!(phases_pinned_by_extra_args(&[]).is_empty());
     }
 
     #[test]

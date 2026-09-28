@@ -118,6 +118,29 @@ phases after it — without that floor the batching sweep alone takes the whole
 default budget at width 3. A phase that reaches the reserve prints that it did,
 so a phase measuring nothing is never silent.
 
+A model's catalog `ExtraArgs` are its owner's pins. They follow every
+candidate value on the server command line, llama.cpp keeps the last
+occurrence of a flag, and they keep winning when the tuned profile is
+launched. So a phase whose flag appears there is not searched: every candidate
+would run as the pinned value while being recorded as something else. The run
+names the pin up front (`catalog: ExtraArgs pin -lm — the memory-flags phase
+is skipped; …`), the phase prints `skipped — pinned by the model's catalog
+ExtraArgs`, and its budget floor goes to the phases that do run. To let
+`findbest` search an axis, remove its flag from `ExtraArgs`:
+
+| Phase | Flags that pin it |
+|---|---|
+| kv-recovery, kv-types | `-ctk`, `--cache-type-k`, `-ctv`, `--cache-type-v` |
+| batching | `-b`, `--batch-size`, `-ub`, `--ubatch-size` |
+| flash-attn | `-fa`, `--flash-attn` |
+| memory-flags | `-lm`, `--load-mode`, `--mmap`, `--no-mmap`, `--mlock` |
+| cache-flags | `--swa-full`, `--cache-prompt`, `--no-cache-prompt`, `--cache-reuse` |
+| threads | `-t`, `--threads`, `-tb`, `--threads-batch` |
+| spec-ngram | `--spec-type` |
+
+Placement flags (`-ngl`, `--n-cpu-moe`, `-ot`) and `-fit` / `-fitt` /
+`-lzm` pin no phase.
+
 1. **baseline** — the catalog defaults: the model's KV pair, and for MoE
    models its catalog `NCpuMoe` offload.
 2. **kv-recovery** — runs *only* when the baseline started, stayed inside
@@ -167,7 +190,10 @@ so a phase measuring nothing is never silent.
    says which limit stopped it and by how much rather than spending a trial to
    discover it — a `NoMmap` launch past the commit limit dies at CUDA
    initialisation, which reads like an unexplained startup failure. If yours
-   does, a larger page file is the remedy.
+   does, a larger page file is the remedy. A per-layer embedding table the
+   build reads from disk on demand (`--lazy-mode`) stays mapped and is not
+   counted: by default that is a table above 4 GiB, any table when the
+   catalog's `ExtraArgs` set `-lzm on`, and none with `-lzm off`.
 7. **cache-flags** — default SWA/cache behaviour vs `--swa-full`,
    `--cache-prompt`, and both together with `CacheReuse=256`.
 8. **threads** — CPU thread sweep, only when the current best actually keeps

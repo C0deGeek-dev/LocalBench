@@ -433,18 +433,19 @@ fn probe_commit_available_gb() -> f64 {
 }
 
 /// Model bytes (GiB) the build keeps memory-mapped even when it loads the
-/// model without mmap: a per-layer embedding table larger than the build's
-/// lazy-read threshold, read from disk on demand. `0.0` for a build without
-/// `--lazy-mode` or a model without such a table.
-fn lazy_mapped_gb(gguf: &std::path::Path, lazy_mode: bool) -> f64 {
+/// model without mmap: a per-layer embedding table the build reads from disk
+/// on demand — above its lazy-read threshold, or any size when the catalog's
+/// `ExtraArgs` pin `--lazy-mode on`. `0.0` for a build without `--lazy-mode`,
+/// a model without such a table, or a catalog pin of `off`.
+fn lazy_mapped_gb(gguf: &std::path::Path, lazy_mode: bool, extra_args: &[String]) -> f64 {
     if !lazy_mode {
         return 0.0;
     }
-    localx_llama_core::quant::shard_files_from_primary(&gguf.to_string_lossy())
+    let table = localx_llama_core::quant::shard_files_from_primary(&gguf.to_string_lossy())
         .iter()
-        .find_map(|shard| localbench::gguf::lazy_table_bytes(std::path::Path::new(shard)))
-        .filter(|bytes| *bytes > localbench::gguf::LAZY_AUTO_MIN_BYTES)
-        .map_or(0.0, |bytes| bytes as f64 / 1_073_741_824.0)
+        .find_map(|shard| localbench::gguf::lazy_table_bytes(std::path::Path::new(shard)));
+    let pin = localbench::gguf::lazy_mode_pin(extra_args);
+    localbench::gguf::lazy_mapped_bytes(table, pin) as f64 / 1_073_741_824.0
 }
 
 /// GPU names for the trial-cache fingerprint — a GPU swap (same VRAM GB) must
@@ -599,6 +600,16 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
     // a dense model is misclassified as MoE and swept on the no-op `--n-cpu-moe`
     // axis until it runs out of candidates with no winner (LocalHub#76).
     let shape = localbench::gguf::read_model_shape(&gguf);
+    // Catalog `ExtraArgs` follow every candidate value on the server command
+    // line and keep winning at launch, so the axes they pin are not searched
+    // (LocalHub#200).
+    let pinned = localbench_search::space::phases_pinned_by_extra_args(&def.extra_args);
+    for pin in &pinned {
+        eprintln!(
+            "catalog: ExtraArgs pin {} — the {} phase is skipped; remove it from ExtraArgs to let findbest search it",
+            pin.flag, pin.phase
+        );
+    }
     let space = resolve_search_space(
         &ModelAxes {
             n_cpu_moe: def.n_cpu_moe,
@@ -607,7 +618,7 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
             moe_expert_layers: None,
             spec_type: def.spec_type.clone(),
             spec_draft_n_max: None,
-            skip_phases: vec![],
+            skip_phases: pinned.iter().map(|pin| pin.phase.to_string()).collect(),
         },
         shape.expert_count,
         shape.block_count,
@@ -781,7 +792,11 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
             available_ram_gb: probe_available_ram_gb(),
             gguf_size_gb: gguf_total_size_gb(&gguf),
             commit_available_gb: probe_commit_available_gb(),
-            lazy_mapped_gb: lazy_mapped_gb(&gguf, launcher.server_capabilities(mode).lazy_mode),
+            lazy_mapped_gb: lazy_mapped_gb(
+                &gguf,
+                launcher.server_capabilities(mode).lazy_mode,
+                &def.extra_args,
+            ),
             // The Windows display driver backs device memory with host commit.
             vram_backed_by_host_commit: cfg!(windows),
         },

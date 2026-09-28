@@ -4,6 +4,18 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **An axis the catalog pins is no longer "searched".** A model's `ExtraArgs`
+  land after every candidate value on the server command line, and llama.cpp
+  keeps the last occurrence of a flag. The Flash-Next entry carried
+  `-lm mmap -b 2048 -ub 512 -fa on`, so every `NoMmap` candidate ran with
+  mmap, the whole batching grid ran as `2048/512`, and `FlashAttn=false` ran
+  with flash attention on — each recorded as the value it never ran, and the
+  `--load-mode none` gain on MoE offload could never be found. A phase whose
+  flag appears in `ExtraArgs` is now skipped and says which flag pins it, and
+  its budget goes to the phases that run. `-lzm on` / `off` in `ExtraArgs`
+  now also decides which per-layer table the memory-flags phase counts as
+  mapped (LocalHub#200).
+
 - **A memory flag the host cannot honour is no longer tried.** `NoMmap` and
   `Mlock` were offered on free RAM alone. On Windows the limit that actually
   fails is commit — RAM plus the page file — and the GPU driver charges its own

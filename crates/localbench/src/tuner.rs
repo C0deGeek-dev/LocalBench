@@ -180,15 +180,39 @@ const PHASE_TRIAL_FLOOR: i64 = 2;
 /// keeps its floor. Computed once when a phase starts, from the trials already
 /// spent. A phase always gets at least one trial while the global budget
 /// lasts, so a small `--budget` degrades to one trial per phase instead of
-/// stopping the search outright.
-fn phase_ceiling(phase: &str, trials_at_phase_start: usize, search_budget: i64) -> i64 {
+/// stopping the search outright. A phase the catalog pins never runs, so it
+/// keeps no floor.
+fn phase_ceiling(
+    phase: &str,
+    trials_at_phase_start: usize,
+    search_budget: i64,
+    pinned: &[String],
+) -> i64 {
     let phases_after = SEARCH_PHASES
         .iter()
         .position(|known| *known == phase)
-        .map_or(0, |index| SEARCH_PHASES.len() - index - 1) as i64;
+        .map_or(0, |index| {
+            SEARCH_PHASES[index + 1..]
+                .iter()
+                .filter(|later| !pinned.iter().any(|p| p == *later))
+                .count()
+        }) as i64;
     search_budget
         .saturating_sub(phases_after * PHASE_TRIAL_FLOOR)
         .max(trials_at_phase_start as i64 + 1)
+}
+
+/// Whether the model's catalog `ExtraArgs` pin `phase` (see
+/// [`localbench_search::space::phases_pinned_by_extra_args`]); a pinned phase
+/// says so instead of measuring the pinned value under other names.
+fn phase_pinned(space: &SearchSpace, phase: &str, events: &mut dyn FnMut(String)) -> bool {
+    let pinned = space.skip_phases.iter().any(|p| p == phase);
+    if pinned {
+        events(format!(
+            "{phase}: skipped — pinned by the model's catalog ExtraArgs"
+        ));
+    }
+    pinned
 }
 
 /// The active phase's spend cap, remembered so the ceiling is computed from
@@ -628,7 +652,7 @@ pub fn run_tuner_with(
         let ceiling = match gate_slot.as_ref() {
             Some(gate) if gate.phase == phase => gate.ceiling,
             _ => {
-                let ceiling = phase_ceiling(phase, *trials, search_budget);
+                let ceiling = phase_ceiling(phase, *trials, search_budget, &space.skip_phases);
                 *gate_slot = Some(PhaseGate {
                     phase: phase.to_string(),
                     ceiling,
@@ -743,13 +767,16 @@ pub fn run_tuner_with(
     let mut effective_kv = params.baseline_kv.clone();
     if baseline_needs_kv_recovery {
         events("phase: kv-recovery".to_string());
+        // A pinned KV pair is the only one the server will run, so there is
+        // nothing to recover to.
+        let kv_pinned = phase_pinned(space, "kv-recovery", events);
         let allowed = resolve_allowed_kv_types(&[], &params.baseline_kv, space_mode(params.mode));
         let alternatives: Vec<KvPair> = kv_candidate_pairs(&allowed, false, false)
             .into_iter()
-            .filter(|pair| *pair != params.baseline_kv)
+            .filter(|pair| !kv_pinned && *pair != params.baseline_kv)
             .take(KV_RECOVERY_MAX_TRIALS)
             .collect();
-        if alternatives.is_empty() {
+        if alternatives.is_empty() && !kv_pinned {
             events(
                 "kv-recovery: the allowed KV cache set offers no alternative to the baseline pair"
                     .to_string(),
@@ -907,7 +934,8 @@ pub fn run_tuner_with(
         // phase never reaches — the exact misreading these counts exist to
         // prevent.
         let budget_remaining = usize::try_from(
-            phase_ceiling("vram-fit", trials, search_budget).saturating_sub(trials as i64),
+            phase_ceiling("vram-fit", trials, search_budget, &space.skip_phases)
+                .saturating_sub(trials as i64),
         )
         .unwrap_or(0);
         let coverage = moe_coverage_worklist(
@@ -982,7 +1010,12 @@ pub fn run_tuner_with(
         };
         (read("UbatchSize"), read("BatchSize"))
     };
-    for parent in beam_so_far(&history) {
+    let batching_parents = if phase_pinned(space, "batching", events) {
+        Vec::new()
+    } else {
+        beam_so_far(&history)
+    };
+    for parent in batching_parents {
         let mut grid = Vec::new();
         for &ub in &space.ubatch_candidates {
             for &b in &space.batch_candidates {
@@ -1032,6 +1065,9 @@ pub fn run_tuner_with(
     ];
     for (phase, overlays) in flag_phases {
         events(format!("phase: {phase}"));
+        if phase_pinned(space, phase, events) {
+            continue;
+        }
         if phase == "memory-flags" {
             for line in pinning_limit_notes(seeds.mmap_recommendation) {
                 events(line);
@@ -1061,7 +1097,12 @@ pub fn run_tuner_with(
 
     // ----- Phase 7: threads (only when work actually runs on the CPU) -----
     events("phase: threads".to_string());
-    for parent in beam_so_far(&history) {
+    let thread_parents = if phase_pinned(space, "threads", events) {
+        Vec::new()
+    } else {
+        beam_so_far(&history)
+    };
+    for parent in thread_parents {
         let cpu_offload = parent
             .overrides
             .get("NCpuMoe")
@@ -1094,7 +1135,12 @@ pub fn run_tuner_with(
 
     // ----- Phase 8: KV cache types -----
     events("phase: kv-types".to_string());
-    for parent in beam_so_far(&history) {
+    let kv_parents = if phase_pinned(space, "kv-types", events) {
+        Vec::new()
+    } else {
+        beam_so_far(&history)
+    };
+    for parent in kv_parents {
         let allowed = resolve_allowed_kv_types(&[], &effective_kv, space_mode(params.mode));
         let candidates: Vec<Overrides> = kv_candidate_pairs(&allowed, false, false)
             .into_iter()
@@ -1122,7 +1168,11 @@ pub fn run_tuner_with(
     // model can try it; it is kept only if the measured score wins.
     if params.spec_ngram {
         events("phase: spec-ngram".to_string());
-        let beam = beam_so_far(&history);
+        let beam = if phase_pinned(space, "spec-ngram", events) {
+            Vec::new()
+        } else {
+            beam_so_far(&history)
+        };
         let overlay = [overrides_of(&[("SpecType", json!(NGRAM_SPEC_TYPE))])];
         for overrides in expand_phase_candidates(&beam, &overlay) {
             measure(
@@ -1597,6 +1647,113 @@ mod tests {
             }
             assert!(outcome.trials as i64 <= 30);
         }
+    }
+
+    /// A phase the catalog's `ExtraArgs` pin runs no trials: every candidate
+    /// would have run as the pinned value (LocalHub#200). The phases that are
+    /// not pinned still run, and the skip is announced.
+    #[test]
+    fn a_phase_pinned_by_catalog_extra_args_is_skipped_and_says_so() {
+        let mut runner = ScriptedRunner { measured: vec![] };
+        let mut events = Vec::new();
+        let mut pinned = space();
+        pinned.skip_phases = vec![
+            "batching".to_string(),
+            "flash-attn".to_string(),
+            "memory-flags".to_string(),
+        ];
+        let mut wide = params();
+        wide.budget = 30;
+        run_tuner(&mut runner, &pinned, &seeds(), &ctx(), &wide, &mut |line| {
+            events.push(line)
+        })
+        .expect("the unpinned phases still produce a verified winner");
+
+        for phase in ["batching", "flash-attn", "memory-flags"] {
+            assert!(
+                !runner.measured.iter().any(|measured| measured == phase),
+                "pinned phase {phase} was measured: {:?}",
+                runner.measured
+            );
+            assert!(
+                events.iter().any(|line| line
+                    == &format!("{phase}: skipped — pinned by the model's catalog ExtraArgs")),
+                "the {phase} skip was not announced: {events:?}"
+            );
+        }
+        for phase in ["baseline", "vram-fit", "cache-flags", "kv-types", "refine"] {
+            assert!(
+                runner.measured.iter().any(|measured| measured == phase),
+                "unpinned phase {phase} was starved: {:?}",
+                runner.measured
+            );
+        }
+    }
+
+    /// A pinned KV pair is the one the server runs, so a content-failed
+    /// baseline has nothing to recover to: the run stops without spending
+    /// trials on pairs that would never reach the server.
+    #[test]
+    fn a_pinned_kv_pair_is_not_recovered_from() {
+        struct AlwaysDegenerate {
+            phases: Vec<String>,
+        }
+        impl TrialRunner for AlwaysDegenerate {
+            fn measure(&mut self, _overrides: &Overrides, phase: &str) -> Trial {
+                self.phases.push(phase.to_string());
+                Trial {
+                    startup_ok: true,
+                    oom: false,
+                    measurement_usable: false,
+                    failure: Some(crate::trial::content_failure_for_test()),
+                    ..Trial::default()
+                }
+            }
+        }
+        let mut runner = AlwaysDegenerate { phases: vec![] };
+        let mut events = Vec::new();
+        let mut pinned = space();
+        pinned.skip_phases = vec!["kv-recovery".to_string(), "kv-types".to_string()];
+        let mut turbo = params();
+        turbo.mode = localx_llama_core::Mode::Turboquant;
+        let outcome = run_tuner(
+            &mut runner,
+            &pinned,
+            &seeds(),
+            &ctx(),
+            &turbo,
+            &mut |line| events.push(line),
+        );
+        assert!(outcome.is_none());
+        assert!(
+            !runner.phases.iter().any(|phase| phase == "kv-recovery"),
+            "{:?}",
+            runner.phases
+        );
+        assert!(
+            events.iter().any(
+                |line| line == "kv-recovery: skipped — pinned by the model's catalog ExtraArgs"
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// A pinned phase keeps no floor, so its share goes to the phases that run.
+    #[test]
+    fn a_pinned_later_phase_frees_its_floor() {
+        let free = phase_ceiling("baseline", 0, 30, &[]);
+        let pinned = phase_ceiling(
+            "baseline",
+            0,
+            30,
+            &["batching".to_string(), "memory-flags".to_string()],
+        );
+        assert_eq!(pinned - free, 2 * PHASE_TRIAL_FLOOR);
+        // Pinning an earlier phase changes nothing for a later one.
+        assert_eq!(
+            phase_ceiling("kv-types", 0, 30, &["batching".to_string()]),
+            phase_ceiling("kv-types", 0, 30, &[])
+        );
     }
 
     /// A capped phase says so. The failure this guards against was silent:

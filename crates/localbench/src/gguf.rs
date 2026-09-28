@@ -50,6 +50,34 @@ pub const LAZY_TABLE: &str = "per_layer_token_embd.weight";
 /// `--lazy-mode auto` reads that table lazily only when it is larger than this.
 pub const LAZY_AUTO_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// The `--lazy-mode` a model's catalog `ExtraArgs` set, when they set one.
+/// The last occurrence wins, as it does on the server command line.
+#[must_use]
+pub fn lazy_mode_pin(extra_args: &[String]) -> Option<&str> {
+    extra_args
+        .windows(2)
+        .rev()
+        .find(|pair| matches!(pair[0].as_str(), "-lzm" | "--lazy-mode"))
+        .map(|pair| pair[1].as_str())
+}
+
+/// How many bytes of a per-layer table of `table_bytes` the build reads on
+/// demand under `pin`: `on` reads any such table lazily, `off` keeps it
+/// resident, and `auto` (the default, and any value this reader does not
+/// know) only above [`LAZY_AUTO_MIN_BYTES`].
+#[must_use]
+pub fn lazy_mapped_bytes(table_bytes: Option<u64>, pin: Option<&str>) -> u64 {
+    let Some(bytes) = table_bytes else {
+        return 0;
+    };
+    match pin.map(str::to_ascii_lowercase).as_deref() {
+        Some("on") => bytes,
+        Some("off") => 0,
+        _ if bytes > LAZY_AUTO_MIN_BYTES => bytes,
+        _ => 0,
+    }
+}
+
 /// The size in bytes of this file's per-layer embedding table, when the file
 /// holds one. A split model keeps it in one shard; the others answer `None`.
 /// Never errors: an unreadable or malformed file yields `None`.
@@ -464,6 +492,31 @@ mod tests {
     fn the_data_section_starts_at_the_files_own_alignment() {
         let bytes = gguf_with_tensors(&[(LAZY_TABLE, 0)], 5000, Some(64));
         assert_eq!(size_of(bytes, LAZY_TABLE), Some(5000));
+    }
+
+    #[test]
+    fn the_catalog_lazy_mode_decides_what_stays_mapped() {
+        let args = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let small = Some(LAZY_AUTO_MIN_BYTES / 2);
+        let large = Some(LAZY_AUTO_MIN_BYTES * 12);
+
+        assert_eq!(lazy_mode_pin(&args(&["-fit", "on"])), None);
+        assert_eq!(lazy_mapped_bytes(small, None), 0);
+        assert_eq!(lazy_mapped_bytes(large, None), LAZY_AUTO_MIN_BYTES * 12);
+
+        let on = args(&["-lzm", "on", "-fit", "on"]);
+        assert_eq!(lazy_mode_pin(&on), Some("on"));
+        assert_eq!(
+            lazy_mapped_bytes(small, lazy_mode_pin(&on)),
+            LAZY_AUTO_MIN_BYTES / 2
+        );
+
+        // The last spelling wins, as on the server command line.
+        let off = args(&["-lzm", "on", "--lazy-mode", "off"]);
+        assert_eq!(lazy_mode_pin(&off), Some("off"));
+        assert_eq!(lazy_mapped_bytes(large, lazy_mode_pin(&off)), 0);
+
+        assert_eq!(lazy_mapped_bytes(None, Some("on")), 0);
     }
 
     #[test]
