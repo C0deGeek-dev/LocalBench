@@ -4,6 +4,19 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **The lesson-on/off A/B can run one arm at a time, and its result says which
+  run it belongs to.** `localbench uplift --task-set … --workspace …` runs both
+  arms back to back, so a caller could never restage memory between them and
+  every such run was void. `uplift --arm baseline|lessons` now runs a single arm
+  in a workspace staged for it and writes an arm file; `uplift --emit-arm-config`
+  prints what to stage (the arms differ only in learning); and
+  `uplift --combine … --with …` joins the two files into a new
+  `localbench-uplift-v2` receipt. The receipt binds the numbers to the caller's
+  binding, the task set's content digest and each arm's configuration and
+  injection inputs, so it can be matched to the run that asked for it rather
+  than to a task-set name. A run whose arm did not inject as configured is an
+  explicit VOID receipt (exit 3) with no uplift number. The existing two-arm
+  command and the v1 report are unchanged.
 - **A split model with a missing shard is completed, not tuned.** The
   pre-flight download looked only at the first shard of a split GGUF, so a
   Flash-Next coder whose second shard never downloaded went straight into a

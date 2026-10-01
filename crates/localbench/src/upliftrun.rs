@@ -18,6 +18,11 @@ use localbench_scoring::uplift::{
     InjectionSummary, MemoryUsed, Significance, TaskResult, SIGNIFICANCE_FLOOR,
 };
 
+use localx_eval_core::uplift::{
+    text_digest, ArmIdentity, ArmRunIdentity, InjectionIdentity, InjectionMode, TaskSetIdentity,
+    UpliftIdentity, UPLIFT_ARM_SCHEMA, UPLIFT_RECEIPT_SCHEMA,
+};
+
 use crate::solver::run_bounded;
 
 /// One headroom task: a prompt the base model fails unguided, graded
@@ -429,6 +434,294 @@ pub fn render_uplift_report(report: &UpliftReport) -> String {
     lines.join("\n")
 }
 
+// --- Per-arm runs and the combined, identity-bound receipt ------------------
+//
+// `run_uplift` runs both arms back to back, which leaves no moment to change
+// the workspace's memory between them. A caller that stages memory per arm
+// runs each arm by itself (`run_arm_file`), then joins the two arm files
+// (`combine`). The statistics and the injection contract are the same ones
+// `run_uplift` uses.
+
+/// The memory configuration an arm's workspace must be staged with.
+#[must_use]
+pub fn arm_config(lesson_arm: bool) -> String {
+    if lesson_arm {
+        localbench_measure::arms::localmind_lesson_arm_config()
+    } else {
+        localbench_measure::arms::localmind_measurement_config()
+    }
+}
+
+/// The seed pack as the exact text `--emit-seed-pack` prints, so its digest is
+/// the same for whoever stages it and whoever attests it.
+///
+/// # Errors
+/// A serialization failure.
+pub fn seed_pack_text(set: &TaskSet) -> Result<String, String> {
+    serde_json::to_string_pretty(&seed_pack(set)).map_err(|e| e.to_string())
+}
+
+/// A task set by the bytes of its file: whoever wrote the file can compute the
+/// same digest without knowing the format.
+#[must_use]
+pub fn task_set_identity(set: &TaskSet, file_bytes: &[u8]) -> TaskSetIdentity {
+    TaskSetIdentity {
+        name: set.name.clone(),
+        digest: text_digest(file_bytes),
+        task_count: set.tasks.len(),
+    }
+}
+
+/// Check the workspace is staged for this arm: its `.localmind.toml` must be
+/// exactly the arm's configuration. Returns the configuration's digest.
+///
+/// # Errors
+/// A mis-staging refusal naming what was found.
+pub fn assert_staged(workspace: &Path, lesson_arm: bool) -> Result<String, String> {
+    let expected = arm_config(lesson_arm);
+    let path = workspace.join(".localmind.toml");
+    let found = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "mis-staged {} arm: {} cannot be read ({e}). Stage the arm's memory \
+             configuration first (uplift --emit-arm-config).",
+            arm_name(lesson_arm),
+            path.display()
+        )
+    })?;
+    if found.replace("\r\n", "\n") != expected {
+        return Err(format!(
+            "mis-staged {} arm: {} is not the arm's configuration. Refusing to run: \
+             the arms may differ only in the seeded lesson.",
+            arm_name(lesson_arm),
+            path.display()
+        ));
+    }
+    Ok(text_digest(expected.as_bytes()))
+}
+
+fn arm_name(lesson_arm: bool) -> &'static str {
+    if lesson_arm {
+        "lessons"
+    } else {
+        "baseline"
+    }
+}
+
+/// What one arm run is asked to do.
+#[derive(Debug, Clone)]
+pub struct ArmRequest<'a> {
+    pub set: &'a TaskSet,
+    pub task_set: TaskSetIdentity,
+    pub lesson_arm: bool,
+    /// The requester's binding for the whole run, carried into the receipt.
+    pub binding: String,
+    pub model: String,
+    pub trials: u32,
+    pub timeout_secs: u64,
+    /// The memory ids the lesson arm must show it used. Ignored for a baseline.
+    pub intended: Vec<String>,
+}
+
+/// One arm's result, with the identity it ran under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArmFile {
+    pub schema: String,
+    pub identity: ArmRunIdentity,
+    pub result: ArmResult,
+}
+
+/// Run one arm in a workspace already staged for it.
+///
+/// # Errors
+/// The grader self-test, a mis-staged workspace, a contaminated baseline
+/// configuration, or the driver's failure.
+pub fn run_arm_file(
+    request: &ArmRequest<'_>,
+    workspace: &Path,
+    driver: &mut dyn UpliftDriver,
+) -> Result<ArmFile, String> {
+    assert_grader_selftest()?;
+    let config_digest = assert_staged(workspace, request.lesson_arm)?;
+    let config = RawArmConfig {
+        is_baseline: Some(!request.lesson_arm),
+        retrieval: request.lesson_arm,
+        ..RawArmConfig::default()
+    };
+    let arm = arm_name(request.lesson_arm);
+    let injection = if request.lesson_arm {
+        InjectionIdentity::lessons(
+            InjectionMode::Retrieved,
+            request.intended.clone(),
+            text_digest(seed_pack_text(request.set)?.as_bytes()),
+        )
+    } else {
+        InjectionIdentity::none()
+    };
+    let result = run_uplift_arm(
+        arm,
+        request.lesson_arm,
+        request.set,
+        driver,
+        request.trials,
+        &config,
+    )?;
+    Ok(ArmFile {
+        schema: UPLIFT_ARM_SCHEMA.to_string(),
+        identity: ArmRunIdentity {
+            binding: request.binding.clone(),
+            task_set: request.task_set.clone(),
+            arm: ArmIdentity {
+                arm: arm.to_string(),
+                is_lesson_arm: request.lesson_arm,
+                config_digest,
+                model: request.model.clone(),
+                trials: request.trials,
+                timeout_secs: request.timeout_secs,
+                injection,
+            },
+        },
+        result,
+    })
+}
+
+/// One arm's row in the combined receipt. `injection` is absent for the arm
+/// that broke the injection contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptArm {
+    #[serde(flatten)]
+    pub aggregate: Aggregate,
+    pub injection: Option<InjectionSummary>,
+}
+
+/// The combined receipt (`localbench-uplift-v2`): the v1 report's numbers,
+/// bound to the content identity of the run that produced them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpliftReceipt {
+    pub schema: String,
+    /// Digest of `identity`.
+    pub run_id: String,
+    pub identity: UpliftIdentity,
+    pub arms: Vec<ReceiptArm>,
+    /// The significance signal. Absent when the run is void.
+    pub uplift: Option<Significance>,
+    /// Why the run is void: an arm did not inject as configured. A void run
+    /// reports no uplift number — it is not "no effect".
+    pub void: Option<String>,
+}
+
+/// Join two arm files into the receipt: the injection contract, aggregation
+/// and significance, over arms proven to be one pair.
+///
+/// # Errors
+/// The files are not a pair of the same request, carry the wrong schema, or
+/// an arm has no tasks. A broken injection contract is not an error: it is a
+/// void receipt.
+pub fn combine(first: &ArmFile, second: &ArmFile) -> Result<UpliftReceipt, String> {
+    for file in [first, second] {
+        if file.schema != UPLIFT_ARM_SCHEMA {
+            return Err(format!(
+                "unsupported arm file schema '{}' (expected {UPLIFT_ARM_SCHEMA})",
+                file.schema
+            ));
+        }
+        if file.result.is_lesson_arm != file.identity.arm.is_lesson_arm
+            || file.result.trials != file.identity.arm.trials
+            || file.result.tasks.len() != file.identity.task_set.task_count
+        {
+            return Err(format!(
+                "arm file '{}' does not match its own identity",
+                file.identity.arm.arm
+            ));
+        }
+    }
+    let identity = UpliftIdentity::pair(&first.identity, &second.identity).map_err(|problems| {
+        format!(
+            "the arm files are not one pair: {}",
+            problems
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
+    let (baseline, lessons) = if first.result.is_lesson_arm {
+        (&second.result, &first.result)
+    } else {
+        (&first.result, &second.result)
+    };
+
+    let baseline_agg = aggregate(baseline).map_err(|e| e.to_string())?;
+    let lesson_agg = aggregate(lessons).map_err(|e| e.to_string())?;
+    let baseline_injection = assert_injection(baseline, &[]);
+    let lesson_injection = assert_injection(lessons, &identity.lessons.injection.intended);
+    let void = [&baseline_injection, &lesson_injection]
+        .iter()
+        .filter_map(|result| result.as_ref().err().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    let uplift = void
+        .is_empty()
+        .then(|| significance(&baseline_agg, &lesson_agg, SIGNIFICANCE_FLOOR));
+    Ok(UpliftReceipt {
+        schema: UPLIFT_RECEIPT_SCHEMA.to_string(),
+        run_id: identity.run_id(),
+        identity,
+        arms: vec![
+            ReceiptArm {
+                aggregate: baseline_agg,
+                injection: baseline_injection.ok(),
+            },
+            ReceiptArm {
+                aggregate: lesson_agg,
+                injection: lesson_injection.ok(),
+            },
+        ],
+        uplift,
+        void: (!void.is_empty()).then(|| void.join(" ")),
+    })
+}
+
+/// Render a combined receipt as Markdown: what it is bound to, then either
+/// the v1 report's table and verdict or, for a void run, why no number exists.
+#[must_use]
+pub fn render_uplift_receipt(receipt: &UpliftReceipt) -> String {
+    let identity = &receipt.identity;
+    let mut lines = vec![
+        format!("Run {} (binding {})", receipt.run_id, identity.binding),
+        format!(
+            "Task set {} — {} ({} tasks)",
+            identity.task_set.name, identity.task_set.digest, identity.task_set.task_count
+        ),
+        String::new(),
+    ];
+    match (&receipt.uplift, &receipt.void) {
+        (Some(uplift), None) => {
+            let arms = receipt
+                .arms
+                .iter()
+                .filter_map(|arm| {
+                    Some(UpliftArmRow {
+                        aggregate: arm.aggregate.clone(),
+                        injection: arm.injection.clone()?,
+                    })
+                })
+                .collect();
+            lines.push(render_uplift_report(&UpliftReport {
+                schema: 1,
+                task_set: identity.task_set.name.clone(),
+                model: identity.lessons.model.clone(),
+                trials: identity.lessons.trials,
+                arms,
+                uplift: uplift.clone(),
+            }));
+        }
+        (_, void) => lines.push(format!(
+            "**VOID** — no uplift number is reported. {}",
+            void.as_deref().unwrap_or("The receipt carries no result.")
+        )),
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -641,5 +934,258 @@ not json at all
         let err = run_uplift(&set, &mut baseline, &mut lessons, &intended, 2, "apex").unwrap_err();
         assert!(err.contains("VOID"));
         assert!(err.contains("lessons"));
+    }
+
+    // --- per-arm runs and the combined receipt ------------------------------
+
+    fn staged(lesson_arm: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".localmind.toml"), arm_config(lesson_arm)).unwrap();
+        dir
+    }
+
+    fn request(set: &TaskSet, lesson_arm: bool) -> ArmRequest<'_> {
+        ArmRequest {
+            set,
+            task_set: task_set_identity(set, TASK_SET.as_bytes()),
+            lesson_arm,
+            binding: "bind-1".to_string(),
+            model: "apex".to_string(),
+            trials: 3,
+            timeout_secs: 600,
+            intended: vec!["mem-migrate".to_string(), "mem-port".to_string()],
+        }
+    }
+
+    fn failing_baseline() -> ScriptedDriver {
+        ScriptedDriver {
+            answers: vec![
+                ("migrate", "Try foo migrate maybe?", vec![]),
+                ("port", "No idea.", vec![]),
+            ],
+        }
+    }
+
+    fn passing_lessons() -> ScriptedDriver {
+        ScriptedDriver {
+            answers: vec![
+                ("migrate", "Run foo db sync.", vec!["mem-migrate"]),
+                ("port", "It uses 7443.", vec!["mem-port"]),
+            ],
+        }
+    }
+
+    fn arm(set: &TaskSet, lesson_arm: bool, driver: &mut ScriptedDriver) -> ArmFile {
+        let workspace = staged(lesson_arm);
+        run_arm_file(&request(set, lesson_arm), workspace.path(), driver).unwrap()
+    }
+
+    #[test]
+    fn each_arm_runs_alone_and_the_pair_combines_into_a_bound_receipt() {
+        let set = task_set();
+        let baseline = arm(&set, false, &mut failing_baseline());
+        let lessons = arm(&set, true, &mut passing_lessons());
+        assert_eq!(baseline.schema, UPLIFT_ARM_SCHEMA);
+        assert_eq!(
+            baseline.identity.arm.config_digest,
+            text_digest(arm_config(false).as_bytes())
+        );
+        assert_eq!(
+            lessons.identity.arm.injection.seed_pack_digest,
+            Some(text_digest(seed_pack_text(&set).unwrap().as_bytes()))
+        );
+
+        // An arm file survives the disk, and the pair combines in either order.
+        let reread: ArmFile =
+            serde_json::from_str(&serde_json::to_string(&lessons).unwrap()).unwrap();
+        let receipt = combine(&reread, &baseline).unwrap();
+        assert_eq!(receipt, combine(&baseline, &lessons).unwrap());
+
+        assert_eq!(receipt.schema, UPLIFT_RECEIPT_SCHEMA);
+        assert_eq!(receipt.run_id, receipt.identity.run_id());
+        assert_eq!(receipt.identity.binding, "bind-1");
+        assert_eq!(
+            receipt.identity.task_set.digest,
+            text_digest(TASK_SET.as_bytes())
+        );
+        assert_eq!(receipt.void, None);
+        assert_eq!(
+            receipt.uplift.as_ref().unwrap().verdict,
+            localbench_scoring::uplift::Verdict::Uplift
+        );
+        assert_eq!(
+            receipt.arms[1].injection.as_ref().unwrap().injected,
+            ["mem-migrate", "mem-port"]
+        );
+    }
+
+    #[test]
+    fn the_four_outcomes_stay_distinct() {
+        let set = task_set();
+        let verdict = |baseline: &mut ScriptedDriver, lessons: &mut ScriptedDriver| {
+            let receipt = combine(&arm(&set, false, baseline), &arm(&set, true, lessons)).unwrap();
+            assert_eq!(receipt.void, None);
+            receipt.uplift.unwrap().verdict
+        };
+        let passing_baseline = || ScriptedDriver {
+            answers: vec![
+                ("migrate", "Run foo db sync.", vec![]),
+                ("port", "It uses 7443.", vec![]),
+            ],
+        };
+        let failing_lessons = || ScriptedDriver {
+            answers: vec![
+                ("migrate", "Try foo migrate.", vec!["mem-migrate"]),
+                ("port", "No idea.", vec!["mem-port"]),
+            ],
+        };
+        use localbench_scoring::uplift::Verdict;
+        // Control fails, treatment passes.
+        assert_eq!(
+            verdict(&mut failing_baseline(), &mut passing_lessons()),
+            Verdict::Uplift
+        );
+        // Both pass, and both fail: no demonstrated effect — not void.
+        assert_eq!(
+            verdict(&mut passing_baseline(), &mut passing_lessons()),
+            Verdict::NoEffect
+        );
+        assert_eq!(
+            verdict(&mut failing_baseline(), &mut failing_lessons()),
+            Verdict::NoEffect
+        );
+        // The lesson made it worse.
+        assert_eq!(
+            verdict(&mut passing_baseline(), &mut failing_lessons()),
+            Verdict::Regression
+        );
+    }
+
+    #[test]
+    fn a_broken_injection_contract_is_a_void_receipt_with_no_number() {
+        let set = task_set();
+        // The control saw the lesson.
+        let mut contaminated = ScriptedDriver {
+            answers: vec![
+                ("migrate", "Run foo db sync.", vec!["mem-migrate"]),
+                ("port", "It uses 7443.", vec![]),
+            ],
+        };
+        let receipt = combine(
+            &arm(&set, false, &mut contaminated),
+            &arm(&set, true, &mut passing_lessons()),
+        )
+        .unwrap();
+        assert_eq!(receipt.uplift, None, "a void run reports no number");
+        assert!(receipt.void.as_ref().unwrap().contains("baseline"));
+        assert_eq!(receipt.arms[0].injection, None);
+        assert!(receipt.arms[1].injection.is_some());
+
+        // The treatment never got the intended lesson — it got another one.
+        let mut wrong_lesson = ScriptedDriver {
+            answers: vec![
+                ("migrate", "Run foo db sync.", vec!["mem-other"]),
+                ("port", "It uses 7443.", vec!["mem-other"]),
+            ],
+        };
+        let receipt = combine(
+            &arm(&set, false, &mut failing_baseline()),
+            &arm(&set, true, &mut wrong_lesson),
+        )
+        .unwrap();
+        assert_eq!(receipt.uplift, None);
+        assert!(receipt.void.as_ref().unwrap().contains("lessons"));
+
+        // Or got nothing at all.
+        let mut nothing = ScriptedDriver {
+            answers: vec![
+                ("migrate", "Run foo db sync.", vec![]),
+                ("port", "It uses 7443.", vec![]),
+            ],
+        };
+        let receipt = combine(
+            &arm(&set, false, &mut failing_baseline()),
+            &arm(&set, true, &mut nothing),
+        )
+        .unwrap();
+        assert!(receipt.void.is_some() && receipt.uplift.is_none());
+    }
+
+    #[test]
+    fn a_mis_staged_workspace_is_refused_before_any_turn() {
+        let set = task_set();
+        struct Unreachable;
+        impl UpliftDriver for Unreachable {
+            fn turn(&mut self, _task: &UpliftTask, _trial: u32) -> Result<Turn, String> {
+                panic!("a mis-staged arm must not spend a turn")
+            }
+        }
+        // The baseline's workspace still has the lesson arm's configuration.
+        let wrong = staged(true);
+        let err = run_arm_file(&request(&set, false), wrong.path(), &mut Unreachable).unwrap_err();
+        assert!(err.contains("mis-staged baseline arm"), "{err}");
+        // No configuration at all.
+        let empty = tempfile::tempdir().unwrap();
+        let err = run_arm_file(&request(&set, true), empty.path(), &mut Unreachable).unwrap_err();
+        assert!(err.contains("mis-staged lessons arm"), "{err}");
+        // CRLF line endings are the same configuration.
+        let crlf = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crlf.path().join(".localmind.toml"),
+            arm_config(false).replace('\n', "\r\n"),
+        )
+        .unwrap();
+        assert!(assert_staged(crlf.path(), false).is_ok());
+    }
+
+    #[test]
+    fn only_a_true_pair_combines() {
+        let set = task_set();
+        let baseline = arm(&set, false, &mut failing_baseline());
+        let lessons = arm(&set, true, &mut passing_lessons());
+
+        // Half a pair, twice.
+        let err = combine(&baseline, &baseline).unwrap_err();
+        assert!(
+            err.contains("not one baseline arm and one lesson arm"),
+            "{err}"
+        );
+
+        // Arms of different requests, task sets or settings.
+        let mut other = lessons.clone();
+        other.identity.binding = "bind-2".to_string();
+        assert!(combine(&baseline, &other).unwrap_err().contains("binding"));
+        let mut other = lessons.clone();
+        other.identity.task_set.digest = "sha256:other".to_string();
+        assert!(combine(&baseline, &other).unwrap_err().contains("task set"));
+        let mut other = lessons.clone();
+        other.identity.arm.model = "another".to_string();
+        assert!(combine(&baseline, &other).unwrap_err().contains("model"));
+
+        // A result swapped under another arm's identity.
+        let mut forged = lessons.clone();
+        forged.result = baseline.result.clone();
+        assert!(combine(&baseline, &forged)
+            .unwrap_err()
+            .contains("does not match its own identity"));
+
+        // An unknown arm-file schema.
+        let mut old = lessons;
+        old.schema = "localbench-uplift-arm-v0".to_string();
+        assert!(combine(&baseline, &old)
+            .unwrap_err()
+            .contains("unsupported"));
+    }
+
+    #[test]
+    fn the_arm_configurations_differ_only_in_learning() {
+        assert_eq!(arm_config(false), "[learning]\nenabled = false\n");
+        let lessons = arm_config(true);
+        assert!(lessons.contains("enabled = true"));
+        assert!(lessons.contains("allowed_scopes = [\"project\"]"));
+        assert!(
+            !lessons.contains("global") && !lessons.contains("inference"),
+            "no machine-wide memory and no model-backed extraction: {lessons}"
+        );
     }
 }

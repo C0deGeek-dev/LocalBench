@@ -303,6 +303,44 @@ trustworthy:
 > LocalPilot store, and a live local-model A/B is opportunistic while the
 > offline, deterministic path is the accepted evidence bar.
 
+### Running the arms one at a time
+
+`localbench uplift --task-set … --workspace …` runs both arms back to back, so
+nothing can restage the workspace between them. A caller that stages memory
+per arm uses the per-arm surface instead:
+
+1. `localbench uplift --emit-arm-config baseline` — write the output to the
+   workspace's `.localmind.toml` (learning off), with a clean store.
+2. `localbench uplift --task-set <file> --arm baseline --workspace <dir>
+   --model <key> --binding <id> --out baseline.json`
+3. `localbench uplift --emit-arm-config lessons` — restage (learning on,
+   project scope only), then seed the pack from `--emit-seed-pack` with
+   `localpilot learning seed`.
+4. `localbench uplift --task-set <file> --arm lessons … --intended <ids>
+   --binding <id> --out lessons.json`
+5. `localbench uplift --combine baseline.json --with lessons.json --out
+   receipt.json`
+
+Each arm run refuses a workspace whose `.localmind.toml` is not exactly that
+arm's configuration. The two configurations differ only in learning, so the
+seeded lesson is the only thing that differs between the arms.
+
+The combine step runs the same injection contract, aggregation and
+significance as the two-arm command. It joins only a true pair: one baseline
+and one lesson arm file with the same binding, task set, model, trial count and
+timeout. Its output is the `localbench-uplift-v2` receipt
+(`schemas/localbench-uplift-v2.schema.json`):
+
+- `identity` binds the numbers to the run: the caller's `--binding`, the task
+  set by the digest of its file, and for each arm its configuration digest,
+  model, trials, timeout and injection inputs (intended ids and the seed pack's
+  digest). A caller matches a receipt on these, never on the task set's name.
+- A broken injection contract does not fail the command silently or produce a
+  number: the receipt is **VOID** (`void` says why, `uplift` is null) and the
+  command exits 3.
+
+The identity types are defined in `localx-eval-core`, shared with the caller.
+
 The report (schema `localbench-uplift-v1`,
 `schemas/localbench-uplift-v1.schema.json`) records both arms, the injection
 audit, and the significance verdict; `localbench uplift --report <file>`

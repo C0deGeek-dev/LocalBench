@@ -41,6 +41,22 @@ commands:
                              lesson arm needs the seed pack staged with learning
                              on (localbench uplift --emit-seed-pack ->
                              localpilot learning seed). A mis-staged run VOIDs.
+  uplift --emit-arm-config baseline|lessons
+                             print the .localmind.toml an arm's workspace must
+                             be staged with
+  uplift --task-set <file> --arm baseline|lessons --workspace <dir>
+         --model <key> --binding <id> --out <arm-file> [--trials <n>]
+         [--localpilot <bin>] [--timeout <s>] [--intended a,b]
+                             run ONE arm in a workspace staged for it, and write
+                             its arm file. Stage, run the baseline, stage, run
+                             the lesson arm; a workspace not staged for the arm
+                             is refused before any turn.
+  uplift --combine <arm-file> --with <arm-file> [--out <receipt>]
+                             join one baseline and one lesson arm file of the
+                             same request into the identity-bound receipt
+                             (localbench-uplift-v2). An arm that did not inject
+                             as configured makes the receipt VOID (exit 3): no
+                             uplift number is reported.
   rescore --dir <cells-dir> [--corpus first-party|external]
                              recompute the comparative report from kept cells
 options:
@@ -282,27 +298,77 @@ fn cmd_arms(args: &[String]) -> Result<ExitCode, String> {
 
 fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
     use localbench::upliftrun::{
-        load_task_set, render_uplift_report, run_uplift, seed_pack, PrintDriver, UpliftReport,
+        arm_config, combine, load_task_set, render_uplift_receipt, render_uplift_report,
+        run_arm_file, run_uplift, seed_pack_text, task_set_identity, ArmFile, ArmRequest,
+        PrintDriver, UpliftReceipt, UpliftReport,
     };
 
-    // Render mode: a saved report becomes Markdown.
+    let arm_flag = |value: &str| match value {
+        "baseline" => Ok(false),
+        "lessons" => Ok(true),
+        other => Err(format!(
+            "unknown arm '{other}' (expected baseline or lessons)"
+        )),
+    };
+    let read_json = |path: &str, what: &str| -> Result<serde_json::Value, String> {
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| format!("{what} not found: {path}: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("{path} does not parse: {e}"))
+    };
+
+    // Render mode: a saved report or receipt becomes Markdown.
     if let Some(report_path) = flag_value(args, "--report") {
-        let raw = std::fs::read_to_string(&report_path)
-            .map_err(|e| format!("uplift report not found: {report_path}: {e}"))?;
-        let report: UpliftReport =
-            serde_json::from_str(&raw).map_err(|e| format!("{report_path} does not parse: {e}"))?;
-        println!("{}", render_uplift_report(&report));
+        let value = read_json(&report_path, "uplift report")?;
+        if value["schema"].is_string() {
+            let receipt: UpliftReceipt = serde_json::from_value(value)
+                .map_err(|e| format!("{report_path} does not parse: {e}"))?;
+            println!("{}", render_uplift_receipt(&receipt));
+        } else {
+            let report: UpliftReport = serde_json::from_value(value)
+                .map_err(|e| format!("{report_path} does not parse: {e}"))?;
+            println!("{}", render_uplift_report(&report));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Arm-configuration mode: print what an arm's workspace is staged with.
+    if let Some(arm) = flag_value(args, "--emit-arm-config") {
+        print!("{}", arm_config(arm_flag(&arm)?));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Combine mode: two arm files become the identity-bound receipt.
+    if let Some(first) = flag_value(args, "--combine") {
+        let second =
+            flag_value(args, "--with").ok_or("uplift --combine needs --with <arm-file>")?;
+        let load = |path: &str| -> Result<ArmFile, String> {
+            serde_json::from_value(read_json(path, "arm file")?)
+                .map_err(|e| format!("{path} does not parse: {e}"))
+        };
+        let receipt = combine(&load(&first)?, &load(&second)?)?;
+        let json = serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?;
+        match flag_value(args, "--out") {
+            Some(out) => {
+                std::fs::write(&out, json).map_err(|e| format!("cannot write {out}: {e}"))?
+            }
+            None => println!("{json}"),
+        }
+        if let Some(reason) = &receipt.void {
+            eprintln!("VOID: {reason}");
+            return Ok(ExitCode::from(3));
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     let set_path = flag_value(args, "--task-set")
         .ok_or("uplift needs --report <file> or --task-set <file>")?;
+    let set_bytes = std::fs::read(&set_path)
+        .map_err(|e| format!("uplift task set not found: {set_path}: {e}"))?;
     let set = load_task_set(std::path::Path::new(&set_path))?;
 
     // Seed-pack projection mode: print the pack the lesson arm seeds.
     if args.iter().any(|a| a == "--emit-seed-pack") {
-        let pack = serde_json::to_string_pretty(&seed_pack(&set)).map_err(|e| e.to_string())?;
-        println!("{pack}");
+        println!("{}", seed_pack_text(&set)?);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -325,6 +391,35 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
     };
 
     let workspace = std::path::PathBuf::from(workspace);
+
+    // Single-arm mode: run one arm in a workspace staged for it.
+    if let Some(arm) = flag_value(args, "--arm") {
+        let lesson_arm = arm_flag(&arm)?;
+        let binding = flag_value(args, "--binding").ok_or("uplift --arm needs --binding <id>")?;
+        let out = flag_value(args, "--out").ok_or("uplift --arm needs --out <arm-file>")?;
+        let request = ArmRequest {
+            set: &set,
+            task_set: task_set_identity(&set, &set_bytes),
+            lesson_arm,
+            binding,
+            model: model.clone(),
+            trials,
+            timeout_secs: timeout,
+            intended: if lesson_arm { intended } else { Vec::new() },
+        };
+        let mut driver = PrintDriver {
+            bin,
+            workspace: workspace.clone(),
+            model,
+            timeout: std::time::Duration::from_secs(timeout),
+        };
+        let file = run_arm_file(&request, &workspace, &mut driver)?;
+        let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+        std::fs::write(&out, json).map_err(|e| format!("cannot write {out}: {e}"))?;
+        eprintln!("wrote the {arm} arm file to {out}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut baseline = PrintDriver {
         bin: bin.clone(),
         workspace: workspace.clone(),

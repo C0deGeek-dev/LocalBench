@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localbench.local/schemas/localbench-uplift-v2.schema.json",
+  "title": "LocalBench lesson-uplift receipt (v2)",
+  "description": "The identity-bound receipt `localbench uplift --combine` emits from one baseline and one lesson arm file (the UpliftReceipt wire format). It carries the v1 report's per-arm aggregates and significance verdict, bound to the content identity of the run that produced them: the requester's binding, the task set by digest, and each arm's configuration and injection inputs. A requester matches a receipt on `identity`, never on a task-set name. When an arm did not inject as configured the receipt is VOID: `void` says why, `uplift` is null and the offending arm's `injection` is null — a void run is not \"no effect\". The identity types are defined once in `localx-eval-core`.",
+  "type": "object",
+  "required": ["schema", "run_id", "identity", "arms", "uplift", "void"],
+  "properties": {
+    "schema": { "const": "localbench-uplift-v2" },
+    "run_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "identity": {
+      "type": "object",
+      "required": ["binding", "task_set", "baseline", "lessons"],
+      "properties": {
+        "binding": { "type": "string" },
+        "task_set": {
+          "type": "object",
+          "required": ["name", "digest", "task_count"],
+          "properties": {
+            "name": { "type": "string" },
+            "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "task_count": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "baseline": { "$ref": "#/$defs/arm_identity" },
+        "lessons": { "$ref": "#/$defs/arm_identity" }
+      }
+    },
+    "arms": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "required": [
+          "arm",
+          "is_lesson_arm",
+          "trials",
+          "task_count",
+          "per_trial_success_rate",
+          "mean",
+          "stddev",
+          "injection"
+        ],
+        "properties": {
+          "arm": { "type": "string", "minLength": 1 },
+          "is_lesson_arm": { "type": "boolean" },
+          "trials": { "type": "integer", "minimum": 1 },
+          "task_count": { "type": "integer", "minimum": 1 },
+          "per_trial_success_rate": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "number", "minimum": 0, "maximum": 1 }
+          },
+          "mean": { "type": "number", "minimum": 0, "maximum": 1 },
+          "stddev": { "type": "number", "minimum": 0 },
+          "injection": {
+            "type": ["object", "null"],
+            "required": ["arm", "is_lesson_arm", "intended", "injected"],
+            "properties": {
+              "arm": { "type": "string", "minLength": 1 },
+              "is_lesson_arm": { "type": "boolean" },
+              "intended": { "type": "array", "items": { "type": "string" } },
+              "injected": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "uplift": {
+      "type": ["object", "null"],
+      "required": [
+        "baseline_arm",
+        "lesson_arm",
+        "baseline_mean",
+        "lesson_mean",
+        "delta",
+        "pooled_std_dev",
+        "band",
+        "effect_size",
+        "verdict"
+      ],
+      "properties": {
+        "baseline_arm": { "type": "string" },
+        "lesson_arm": { "type": "string" },
+        "baseline_mean": { "type": "number" },
+        "lesson_mean": { "type": "number" },
+        "delta": { "type": "number" },
+        "pooled_std_dev": { "type": "number", "minimum": 0 },
+        "band": { "type": "number", "minimum": 0 },
+        "effect_size": { "type": ["number", "null"] },
+        "verdict": { "enum": ["uplift", "no-effect", "regression"] }
+      }
+    },
+    "void": { "type": ["string", "null"] }
+  },
+  "$defs": {
+    "arm_identity": {
+      "type": "object",
+      "required": [
+        "arm",
+        "is_lesson_arm",
+        "config_digest",
+        "model",
+        "trials",
+        "timeout_secs",
+        "injection"
+      ],
+      "properties": {
+        "arm": { "type": "string", "minLength": 1 },
+        "is_lesson_arm": { "type": "boolean" },
+        "config_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "model": { "type": "string", "minLength": 1 },
+        "trials": { "type": "integer", "minimum": 1 },
+        "timeout_secs": { "type": "integer", "minimum": 0 },
+        "injection": {
+          "type": "object",
+          "required": ["mode", "intended", "seed_pack_digest"],
+          "properties": {
+            "mode": { "enum": ["forced", "retrieved"] },
+            "intended": { "type": "array", "items": { "type": "string" } },
+            "seed_pack_digest": { "type": ["string", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

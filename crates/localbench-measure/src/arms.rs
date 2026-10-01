@@ -133,6 +133,15 @@ pub fn localmind_measurement_config() -> String {
     "[learning]\nenabled = false\n".to_string()
 }
 
+/// The `.localmind.toml` the LESSON arm of a lesson-off/on A/B runs with:
+/// learning on, the project's own store only. Nothing else is switched on — no
+/// machine-wide memory, no review automation, no model-backed extraction — so
+/// the seeded lesson is the only thing that differs from the measurement arm.
+#[must_use]
+pub fn localmind_lesson_arm_config() -> String {
+    "[learning]\nenabled = true\nallowed_scopes = [\"project\"]\n".to_string()
+}
+
 /// Knobs for the warm arm's `.localmind.toml`.
 #[derive(Debug, Clone)]
 pub struct WarmConfigParams {

@@ -153,6 +153,75 @@ fn the_uplift_emitter_conforms_to_the_declared_schema() {
     assert_valid(&schema, &value, "emitted uplift report");
 }
 
+/// A receipt built through the real per-arm and combine path. `used_by_lessons`
+/// is what the lesson arm's turns record; anything but the intended id voids.
+fn receipt(used_by_lessons: &str) -> serde_json::Value {
+    use localbench::upliftrun::{
+        arm_config, combine, run_arm_file, task_set_identity, ArmRequest, TaskSet, Turn,
+        UpliftDriver, UpliftTask,
+    };
+    struct Fixed {
+        answer: &'static str,
+        used: Vec<MemoryUsed>,
+    }
+    impl UpliftDriver for Fixed {
+        fn turn(&mut self, _task: &UpliftTask, _trial: u32) -> Result<Turn, String> {
+            Ok(Turn {
+                answer: self.answer.to_string(),
+                memories_used: self.used.clone(),
+            })
+        }
+    }
+    let raw = r#"{"schema":1,"name":"headroom-mini","tasks":[{"id":"migrate","prompt":"How do I migrate?","expect":{"mode":"substring","value":"foo db sync"}}],"lessons":[{"id":"l1","body":"Use foo db sync."}]}"#;
+    let set: TaskSet = serde_json::from_str(raw).unwrap();
+    let arm = |lesson_arm: bool, driver: &mut Fixed| {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join(".localmind.toml"),
+            arm_config(lesson_arm),
+        )
+        .unwrap();
+        let request = ArmRequest {
+            set: &set,
+            task_set: task_set_identity(&set, raw.as_bytes()),
+            lesson_arm,
+            binding: "example-binding".to_string(),
+            model: "example-local-model".to_string(),
+            trials: 3,
+            timeout_secs: 600,
+            intended: vec!["mem-guard-rails".to_string()],
+        };
+        run_arm_file(&request, workspace.path(), driver).unwrap()
+    };
+    let baseline = arm(
+        false,
+        &mut Fixed {
+            answer: "I do not know.",
+            used: Vec::new(),
+        },
+    );
+    let lessons = arm(
+        true,
+        &mut Fixed {
+            answer: "Run foo db sync.",
+            used: used(used_by_lessons),
+        },
+    );
+    serde_json::to_value(combine(&baseline, &lessons).unwrap()).unwrap()
+}
+
+#[test]
+fn the_uplift_receipt_emitter_conforms_to_the_declared_schema() {
+    let schema = compiled_schema("localbench-uplift-v2.schema.json");
+    let valid = receipt("mem-guard-rails");
+    assert_valid(&schema, &valid, "combined uplift receipt");
+    assert_eq!(valid["uplift"]["verdict"], "uplift");
+
+    let void = receipt("mem-something-else");
+    assert_valid(&schema, &void, "void uplift receipt");
+    assert!(void["uplift"].is_null() && void["void"].is_string());
+}
+
 #[test]
 fn the_capability_emitter_conforms_to_the_declared_schema() {
     let schema = compiled_schema("localbench-capability-v1.schema.json");

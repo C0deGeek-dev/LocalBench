@@ -12,6 +12,7 @@ the source of truth for which are current.
 | `localbox-autobest-v1.schema.json` | **current** | The AutoBest launcher-profile shape LocalBox consumes. |
 | `localbench-capability-v1.schema.json` | **current** | The cross-arm harness-capability report `localbench arms`/`rescore` render. |
 | `localbench-uplift-v1.schema.json` | **current** | The lesson-on/off uplift A/B report `localbench uplift` renders (mean ± stddev, significance verdict, memories-used injection assertion). |
+| `localbench-uplift-v2.schema.json` | **current** | The identity-bound receipt `localbench uplift --combine` emits from two arm files: the v1 numbers bound to the run's binding, task-set digest, and each arm's configuration and injection inputs, with an explicit VOID state. The identity types live in `localx-eval-core`. |
 | `hardware-profile.schema.json` | **retired** | No current emitter — the hardware-profile report is not produced by the Rust binary. Kept for history; do not treat as a live contract. |
 | `localbench-tds-v1.schema.json` | **retired** | No current emitter — the Tool Discipline Score report is not produced by the Rust binary (the `scoring::tds` module is library-only/unwired). Kept for history. |
 

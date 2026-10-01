@@ -68,6 +68,24 @@ localbench uplift --task-set <file> --workspace <dir> --model <key>
     injection contract voids a result when an arm did not inject as
     configured.
 
+localbench uplift --emit-arm-config baseline|lessons
+    Print the .localmind.toml an arm's workspace must be staged with:
+    learning off for the baseline; learning on, project scope only, for
+    the lesson arm.
+
+localbench uplift --task-set <file> --arm baseline|lessons
+                  --workspace <dir> --model <key> --binding <id>
+                  --out <arm-file> [--trials <n>] [--localpilot <bin>]
+                  [--timeout <s>] [--intended <id,id,...>]
+    Run ONE arm in a workspace staged for it and write its arm file. A
+    workspace whose .localmind.toml is not the arm's configuration is
+    refused before any turn.
+
+localbench uplift --combine <arm-file> --with <arm-file> [--out <file>]
+    Join one baseline and one lesson arm file of the same request into
+    the identity-bound receipt (localbench-uplift-v2). Exit 3 with a VOID
+    receipt when an arm did not inject as configured.
+
 localbench rescore --dir <cells-dir> [--corpus first-party|external]
     Recompute the comparative capability report from kept cells — no
     solver run, no model, deterministic.
