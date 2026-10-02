@@ -4,6 +4,9 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **`uplift --timeout 0` sets no per-turn bound.** A slow local model can take
+  minutes per turn; a zero timeout lets each solver turn run until it exits.
+  The default (600 s) is unchanged.
 - **`localbench uplift --help` prints the uplift usage.** It used to print an
   error asking for `--report` or `--task-set`, which hid the per-arm options.
 - **The lesson-on/off A/B can run one arm at a time, and its result says which

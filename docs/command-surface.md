@@ -66,7 +66,8 @@ localbench uplift --task-set <file> --workspace <dir> --model <key>
     Run the live lesson-on/off A/B via localpilot print (or print the
     seed pack the lesson arm needs). Seed the lesson arm first; the
     injection contract voids a result when an arm did not inject as
-    configured.
+    configured. --timeout bounds each solver turn (default 600 s);
+    --timeout 0 sets no bound, for a slow local model.
 
 localbench uplift --emit-arm-config baseline|lessons
     Print the .localmind.toml an arm's workspace must be staged with:

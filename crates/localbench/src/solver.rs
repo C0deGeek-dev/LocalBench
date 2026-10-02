@@ -96,7 +96,8 @@ pub struct BoundedRun {
 }
 
 /// Run a command to completion under a wall-clock bound, capturing stdout and
-/// stderr in regular temporary files. Descendants may inherit those handles,
+/// stderr in regular temporary files. A zero `timeout` means no bound: the
+/// command runs until it exits, which is what a slow local model needs. Descendants may inherit those handles,
 /// but unlike pipes they cannot keep a reader blocked waiting for EOF. Each
 /// child owns a process group/tree; on expiry that exact tree is terminated.
 ///
@@ -132,14 +133,14 @@ pub fn run_bounded(
         .spawn()
         .map_err(|e| format!("could not start {program}: {e}"))?;
 
-    let deadline = Instant::now() + timeout;
+    let deadline = (!timeout.is_zero()).then(|| Instant::now() + timeout);
     let mut timed_out = false;
     let mut cleanup_diagnostic = None;
     let exit_ok = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
             Ok(None) => {
-                if Instant::now() >= deadline {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     timed_out = true;
                     cleanup_diagnostic = terminate_and_reap_process_tree(&mut child, program);
                     break false;
@@ -629,5 +630,26 @@ mod tests {
             .solve(Path::new("Z:/definitely/not/here"), &spec)
             .unwrap_err();
         assert!(err.contains("workspace not found"));
+    }
+
+    #[test]
+    fn a_zero_timeout_is_no_bound_and_the_command_runs_to_its_end() {
+        // Long enough that a zero treated as "expire now" would kill it first.
+        let (program, args): (&str, Vec<String>) = if cfg!(windows) {
+            (
+                "pwsh",
+                vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Milliseconds 700; 'done'".into(),
+                ],
+            )
+        } else {
+            ("sh", vec!["-c".into(), "sleep 0.7; echo done".into()])
+        };
+        let run = run_bounded(program, &args, None, Duration::ZERO).unwrap();
+        assert!(!run.timed_out);
+        assert!(run.exit_ok);
+        assert!(run.stdout.contains("done"), "{}", run.stdout);
     }
 }

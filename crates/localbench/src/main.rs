@@ -41,6 +41,8 @@ commands:
                              lesson arm needs the seed pack staged with learning
                              on (localbench uplift --emit-seed-pack ->
                              localpilot learning seed). A mis-staged run VOIDs.
+                             --timeout bounds each solver turn (default 600 s);
+                             --timeout 0 sets no bound, for a slow local model.
   uplift --emit-arm-config baseline|lessons
                              print the .localmind.toml an arm's workspace must
                              be staged with
