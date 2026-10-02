@@ -1,24 +1,9 @@
-```text
-                   ▄▄██║
-             ▄▄██║ ████║  ██╗      ██████╗  ██████╗ █████╗ ██╗     ██████╗ ███████╗███╗   ██╗ ██████╗██╗  ██╗
-       ▄▄██║ ████║ ████║  ██║     ██╔═══██╗██╔════╝██╔══██╗██║     ██╔══██╗██╔════╝████╗  ██║██╔════╝██║  ██║
- ▄▄██║ ████║ ████║ ████║  ██║     ██║   ██║██║     ███████║██║     ██████╔╝█████╗  ██╔██╗ ██║██║     ███████║
- ████║ ████║ ████║ ████║  ██║     ██║   ██║██║     ██╔══██║██║     ██╔══██╗██╔══╝  ██║╚██╗██║██║     ██╔══██║
- ████║ ████║ ████║ ████║  ███████╗╚██████╔╝╚██████╗██║  ██║███████╗██████╔╝███████╗██║ ╚████║╚██████╗██║  ██║
- ████║ ████║ ████║ ████║  ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
-╔══════════════════════╗
-╚══════════════════════╝
-                                        >  Automated LLM Benchmarking  <
-```
+![LocalBench — Measure first. Find settings that work.](docs/assets/readme-banner.svg)
 
 <div align="center">
   <h1>LocalBench</h1>
   <p><strong>Find the fastest stable local-model settings for your machine.</strong></p>
-  <p>
-    <a href="docs/command-surface.md">Command reference</a> ·
-    <a href="docs/tuning.md">Tuning guide</a> ·
-    <a href="https://c0degeek-dev.github.io/LocalStack/">LocalX</a>
-  </p>
+  <p><a href="#install-localx">Install</a> · <a href="#tune-a-model-you-already-use">First use</a> · <a href="#updates-and-troubleshooting">Updates &amp; help</a> · <a href="docs/README.md">All guides</a></p>
   <p>
     <img alt="LocalX release train 5.0.0" src="https://img.shields.io/badge/release%20train-v5.0.0-f0b75a?style=flat-square">
     <img alt="Rust" src="https://img.shields.io/badge/platform-Rust-4d8df7?style=flat-square">
@@ -37,7 +22,127 @@ again instead of tuning by feel.
 | **Use it when** | A model runs, but you do not know which settings are actually best |
 | **It measures** | Hardware fit, prompt processing, generation, memory pressure, and stability |
 | **It produces** | Recommendations, Markdown reports, and LocalBox-compatible AutoBest profiles |
-| **Default goal** | Coding-agent latency, where prompt prefill matters as much as generation speed |
+| **Default goal** | Responsive coding sessions, including how quickly the model reads a prompt |
+
+<a name="quick-start"></a>
+
+## Install LocalX
+
+**No programming tools or compilation required.** The installer downloads ready-to-run
+applications and checks their SHA-256 checksums. You get **LocalBox, LocalPilot,
+LocalMind, and LocalBench**, plus `localx` for managing them and the llama.cpp
+engine for running models. You do not need to clone this repository.
+
+### 1. Run the installer
+
+**Windows 10/11 (64-bit Intel or AMD):** open the Start menu, type **PowerShell**,
+and open it. Paste this command, then press **Enter**:
+
+```powershell
+irm https://raw.githubusercontent.com/C0deGeek-dev/LocalPilot/main/install/install.ps1 | iex
+```
+
+**Linux (x86-64 or ARM64) / macOS (Apple Silicon):** open **Terminal**, paste
+this command, then press **Enter**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/C0deGeek-dev/LocalPilot/main/install/install.sh | sh
+```
+
+### 2. Let your terminal find the commands
+
+`PATH` is the list of folders your terminal searches for applications. Add the
+LocalX folder once so commands such as `localx update` work from any directory.
+
+<details>
+<summary><strong>Windows — paste this into the same PowerShell window</strong></summary>
+
+```powershell
+$localxBin = Join-Path $env:LOCALAPPDATA 'localx\bin'
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $localxBin) {
+    [Environment]::SetEnvironmentVariable('Path', "$localxBin;$userPath", 'User')
+}
+$env:Path = "$localxBin;$env:Path"
+```
+
+This enables the commands in this window and saves the setting for future
+terminals. If another open terminal cannot find them, close and reopen it.
+
+</details>
+
+<details>
+<summary><strong>Linux / macOS — add LocalX to your shell's PATH</strong></summary>
+
+Paste this into your terminal:
+
+```sh
+export PATH="${XDG_DATA_HOME:-$HOME/.local/share}/localx/bin:$PATH"
+```
+
+To keep it for future terminals, add the same line to your shell configuration:
+`~/.bashrc` for Bash or `~/.zshrc` for Zsh. Use the directory printed by the
+installer if it differs.
+
+</details>
+
+### 3. Check the installation
+
+```sh
+localx status
+```
+
+You should see the installed tools and engine. **Installing the tools does not
+download an AI model**; choose one when you start using LocalBox.
+
+Want to read the installer before running it, check platform support, or install
+a specific version? See the [installation guide](https://github.com/C0deGeek-dev/LocalPilot/blob/main/docs/install.md).
+
+## Tune a model you already use
+
+**Start with a working LocalBox model.** If you have not chosen one yet, run
+`localbox` to open the guided launcher. LocalBench uses LocalBox's catalog and
+model engine to measure real runs on your hardware.
+
+List the model keys:
+
+```sh
+localbox info
+```
+
+Then tune one of them:
+
+```sh
+localbench findbest --model <model-key>
+```
+
+Replace `<model-key>` with a key from that list; do not type the angle brackets.
+To target a specific context size, add `--context <context-key>` using a value
+shown by `localbox info <model-key>`.
+
+**What happens next:** LocalBench tests settings, checks stability, and saves the
+winner to `~/.local-llm/tuner/best-<key>.json`. LocalBox can use that saved profile
+on later launches. Tuning runs real workloads and can take time.
+
+| I want to… | Start here |
+|---|---|
+| Find settings for one model | `localbench findbest --model <model-key>` |
+| Understand the tuning choices | [Tuning guide](docs/tuning.md) |
+| Explore benchmarks and evaluation | [Command reference](docs/command-surface.md) |
+
+## Updates and troubleshooting
+
+| I want to… | Run |
+|---|---|
+| Update the whole stack and model engine | `localx update` |
+| See installed versions | `localx status` |
+| Diagnose installation problems | `localx doctor` |
+| Retry an incomplete installation | `localx install` |
+
+Ordinary installs use published releases; updates do not require Rust or Git.
+If a command is “not recognized” or “not found”, complete the PATH step above.
+If an older installation is taking precedence, `localx doctor` identifies it;
+review its findings before using `localx doctor --fix` to remove old copies.
 
 ## Privacy by design
 
@@ -51,47 +156,6 @@ LocalBench measures your machine locally and writes results for you, not for us.
   local files you can inspect, move, keep, or delete.
 - **No account required.** Benchmarking does not require a LocalX account or a
   hosted API key.
-
-## Quick start
-
-The quickest install is the LocalX one-liner, which installs `localbench`
-alongside the rest of the stack at one version — no Rust toolchain needed:
-
-```sh
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/C0deGeek-dev/LocalPilot/main/install/install.sh | sh
-```
-
-```powershell
-# Windows
-irm https://raw.githubusercontent.com/C0deGeek-dev/LocalPilot/main/install/install.ps1 | iex
-```
-
-The tools are cut as a set and only tested together, so they are installed as a
-set; `localpilot update --all` re-runs it. Each release also publishes verified
-per-platform archives if you would rather install `localbench` on its own.
-
-LocalBench is a single native binary — no PowerShell, .NET, or Python needed.
-Build it from this repository (or use a release binary):
-
-```text
-cargo install --path crates/localbench --locked
-```
-
-Then tune one of your installed model keys:
-
-```text
-localbench findbest --model <model-key> --context <context>
-```
-
-The winner is saved to `~/.local-llm/tuner/best-<key>.json`, where LocalBox's
-guided launcher replays it as the auto-tuned profile.
-
-> [!NOTE]
-> Real tuning still needs a launcher that satisfies LocalBench's
-> [launcher contract](docs/launcher-contract.md). LocalBox is the default
-> adapter and supplies the model catalog, llama-server arguments, VRAM logic,
-> and server lifecycle.
 
 ## What question does it answer?
 
@@ -170,6 +234,19 @@ LocalBench is the measurement layer in the
 | [LocalMind](https://github.com/C0deGeek-dev/LocalMind) | Turn reviewed sessions into reusable project memory |
 
 Release history lives in [CHANGELOG.md](CHANGELOG.md).
+
+<details>
+<summary><strong>Build from source (developers only)</strong></summary>
+
+The ready-to-run installation above is sufficient for normal use. Building from
+source requires Rust and the platform build tools. Run these commands from the
+repository checkout unless a clone command is shown:
+
+```sh
+cargo install --path crates/localbench --locked
+```
+
+</details>
 
 ## License
 
