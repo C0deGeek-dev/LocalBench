@@ -203,6 +203,26 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// The part of [`USAGE`] about one command: every line that starts the command
+/// and the continuation lines under it.
+fn usage_for(command: &str) -> String {
+    let head = format!("  {command} ");
+    let mut out = format!("usage: localbench {command} [options]\n");
+    let mut inside = false;
+    for line in USAGE.lines() {
+        if line.starts_with(&head) {
+            inside = true;
+        } else if inside && !line.starts_with("    ") {
+            inside = false;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn cmd_arms(args: &[String]) -> Result<ExitCode, String> {
     use localbench::matrix::{
         load_run_spec, os_exec, render_capability_report, run_matrix, ContainerGrader, Grader,
@@ -302,6 +322,11 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
         run_arm_file, run_uplift, seed_pack_text, task_set_identity, ArmFile, ArmRequest,
         PrintDriver, UpliftReceipt, UpliftReport,
     };
+
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{}", usage_for("uplift"));
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let arm_flag = |value: &str| match value {
         "baseline" => Ok(false),

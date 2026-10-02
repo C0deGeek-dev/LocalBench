@@ -297,3 +297,23 @@ fn the_seed_pack_and_arm_configurations_are_emitted_without_a_model() {
     let unknown = localbench(&["uplift", "--emit-arm-config", "warm"]);
     assert!(!unknown.status.success());
 }
+
+#[test]
+fn uplift_help_prints_the_uplift_usage_and_succeeds() {
+    for flag in ["--help", "-h"] {
+        let output = localbench(&["uplift", flag]);
+        assert!(output.status.success(), "{flag}: {}", stderr(&output));
+        let text = stdout(&output);
+        assert!(text.starts_with("usage: localbench uplift"), "{text}");
+        for option in [
+            "--emit-arm-config",
+            "--arm",
+            "--binding",
+            "--combine",
+            "--with",
+        ] {
+            assert!(text.contains(option), "{flag} lacks {option}: {text}");
+        }
+        assert!(!text.contains("findbest"), "only the uplift usage: {text}");
+    }
+}

@@ -4,6 +4,8 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **`localbench uplift --help` prints the uplift usage.** It used to print an
+  error asking for `--report` or `--task-set`, which hid the per-arm options.
 - **The lesson-on/off A/B can run one arm at a time, and its result says which
   run it belongs to.** `localbench uplift --task-set … --workspace …` runs both
   arms back to back, so a caller could never restage memory between them and
