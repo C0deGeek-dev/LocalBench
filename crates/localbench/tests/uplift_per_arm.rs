@@ -317,3 +317,71 @@ fn uplift_help_prints_the_uplift_usage_and_succeeds() {
         assert!(!text.contains("findbest"), "only the uplift usage: {text}");
     }
 }
+
+/// A solver turn that stops without an answer fails the arm with the reason.
+/// It is never graded as a wrong answer about the lesson.
+#[test]
+fn a_solver_turn_that_errored_fails_the_arm_instead_of_counting_as_a_miss() {
+    let fixture = fixture("mem-1");
+    let failing = if cfg!(windows) {
+        let path = fixture.dir.path().join("errored.cmd");
+        std::fs::write(
+            &path,
+            "@echo off\r\n\
+             copy /y baseline-log.jsonl .localpilot\\sessions\\turn.jsonl >nul\r\n\
+             echo I was writing an answer when\r\n\
+             echo handoff: {\"files_changed\":[],\"stop\":\"ProviderError\",\"tool_calls\":0} 1>&2\r\n\
+             exit /b 0\r\n",
+        )
+        .unwrap();
+        path
+    } else {
+        let path = fixture.dir.path().join("errored.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             cp baseline-log.jsonl .localpilot/sessions/turn.jsonl\n\
+             echo 'I was writing an answer when'\n\
+             echo 'handoff: {\"files_changed\":[],\"stop\":\"ProviderError\",\"tool_calls\":0}' 1>&2\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    };
+    fixture.stage("baseline");
+    let out = fixture.dir.path().join("baseline.json");
+    let output = localbench(&[
+        "uplift",
+        "--task-set",
+        fixture.task_set.to_str().unwrap(),
+        "--arm",
+        "baseline",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "--model",
+        "fixture-model",
+        "--trials",
+        "1",
+        "--timeout",
+        "60",
+        "--localpilot",
+        failing.to_str().unwrap(),
+        "--binding",
+        "b-1",
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let text = stderr(&output);
+    assert!(text.contains("stopped without an answer"), "{text}");
+    assert!(text.contains("ProviderError"), "{text}");
+    assert!(
+        !out.exists(),
+        "no arm file is written for an arm that failed"
+    );
+}

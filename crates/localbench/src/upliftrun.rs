@@ -164,6 +164,33 @@ pub fn latest_session_log(workspace: &Path) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
+/// The stop reasons with which a `localpilot print` turn ends without having
+/// answered: the provider failed or was marked degraded, the turn was
+/// cancelled, timed out, or shut down. A turn that answered (`Done`) or that
+/// the model itself ran into the ground (`BudgetExceeded`, `NoProgress`) is
+/// graded like any other answer.
+pub const NON_ANSWER_STOPS: &[&str] = &[
+    "ProviderError",
+    "Degraded",
+    "Cancelled",
+    "TimedOut",
+    "Quiesced",
+];
+
+/// The stop reason from the last `handoff:` line `localpilot print` writes to
+/// stderr, when it is one of [`NON_ANSWER_STOPS`]. `None` for an answered turn,
+/// and for output with no readable handoff (an older solver).
+#[must_use]
+pub fn turn_stopped_without_answer(stderr: &str) -> Option<String> {
+    let handoff = stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("handoff:"))?;
+    let value: serde_json::Value = serde_json::from_str(handoff.trim()).ok()?;
+    let stop = value["stop"].as_str()?;
+    NON_ANSWER_STOPS.contains(&stop).then(|| stop.to_string())
+}
+
 /// One trial's turn: the model's answer plus the recorded injection audit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Turn {
@@ -214,6 +241,16 @@ impl UpliftDriver for PrintDriver {
                 self.bin,
                 task.id,
                 run.stderr.trim()
+            ));
+        }
+        // A turn that stopped without an answer exits 0 and leaves partial text
+        // on stdout. Grading that as a miss would count an infrastructure
+        // failure as evidence about the lesson, so it fails the arm instead.
+        if let Some(stop) = turn_stopped_without_answer(&run.stderr) {
+            return Err(format!(
+                "'{} print' stopped without an answer (task '{}'): the turn ended with {stop}, \
+                 which says nothing about the lesson",
+                self.bin, task.id
             ));
         }
         let memories = latest_session_log(&self.workspace)
@@ -725,6 +762,34 @@ pub fn render_uplift_receipt(receipt: &UpliftReceipt) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[test]
+    fn a_turn_that_ended_without_an_answer_is_recognised_from_its_handoff() {
+        let handoff = |stop: &str| {
+            format!(
+                "warning: something\nhandoff: {{\"files_changed\":[],\"stop\":\"{stop}\",\"tool_calls\":0}}\n"
+            )
+        };
+        for stop in NON_ANSWER_STOPS {
+            assert_eq!(
+                turn_stopped_without_answer(&handoff(stop)).as_deref(),
+                Some(*stop)
+            );
+        }
+        for answered in ["Done", "BudgetExceeded", "NoProgress"] {
+            assert_eq!(
+                turn_stopped_without_answer(&handoff(answered)),
+                None,
+                "{answered}"
+            );
+        }
+        // No handoff, or one that does not parse: graded as before.
+        assert_eq!(turn_stopped_without_answer("just some stderr\n"), None);
+        assert_eq!(turn_stopped_without_answer("handoff: not json\n"), None);
+        // The last handoff wins.
+        let both = format!("{}{}", handoff("ProviderError"), handoff("Done"));
+        assert_eq!(turn_stopped_without_answer(&both), None);
+    }
+
     use super::*;
 
     const TASK_SET: &str = r#"{

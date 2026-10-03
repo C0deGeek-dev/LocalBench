@@ -4,6 +4,11 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **An uplift turn that stops without an answer fails the arm.** When
+  `localpilot print` ends a turn with `ProviderError`, `Degraded`, `Cancelled`,
+  `TimedOut` or `Quiesced`, the arm now fails with that reason instead of
+  grading the partial text as a wrong answer, which counted an infrastructure
+  failure as evidence that the lesson did not help.
 - **`uplift --timeout 0` sets no per-turn bound.** A slow local model can take
   minutes per turn; a zero timeout lets each solver turn run until it exits.
   The default (600 s) is unchanged.
