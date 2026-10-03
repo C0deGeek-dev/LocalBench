@@ -305,6 +305,18 @@ trustworthy:
 
 ### Running the arms one at a time
 
+Use `--answer-only` on both arms to measure use of supplied knowledge in an
+answer turn. The driver forwards it to `localpilot print`: context sits beside
+the question as reference data, and no tools run. Arm files and receipts record
+and bind this mode; combining different modes is refused. Historical files with
+no mode field mean coding-agent mode. LocalPilot lab uplift uses answer-only and
+cannot reuse an older coding-agent baseline.
+
+Legacy configuration digests remain unchanged. Answer-only configuration
+identity hashes UTF-8 `answer-only-context-v1:<memory-digest>` with SHA-256.
+The injection audit proves delivery; answer grading measures use of the supplied
+knowledge. Neither guarantees uplift or supports broad model-quality claims.
+
 `localbench uplift --task-set … --workspace …` runs both arms back to back, so
 nothing can restage the workspace between them. A caller that stages memory
 per arm uses the per-arm surface instead:

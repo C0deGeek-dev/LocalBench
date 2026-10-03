@@ -212,6 +212,7 @@ pub trait UpliftDriver {
 /// The live driver: `localpilot print "<prompt>" --model <m>` in the
 /// workspace, then the turn's memories-used from the newest session log.
 pub struct PrintDriver {
+    pub answer_only: bool,
     pub bin: String,
     pub workspace: PathBuf,
     pub model: String,
@@ -220,12 +221,15 @@ pub struct PrintDriver {
 
 impl UpliftDriver for PrintDriver {
     fn turn(&mut self, task: &UpliftTask, _trial: u32) -> Result<Turn, String> {
-        let args = vec![
+        let mut args = vec![
             "print".to_string(),
             task.prompt.clone(),
             "--model".to_string(),
             self.model.clone(),
         ];
+        if self.answer_only {
+            args.push("--answer-only".to_string());
+        }
         let run = run_bounded(&self.bin, &args, Some(&self.workspace), self.timeout)?;
         if run.timed_out {
             return Err(format!(
@@ -342,6 +346,9 @@ pub struct UpliftArmRow {
 /// The uplift report (`localbench-uplift-v1`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpliftReport {
+    /// Whether turns answered from adjacent context without tools.
+    #[serde(default)]
+    pub answer_only: bool,
     pub schema: u32,
     pub task_set: String,
     pub model: String,
@@ -396,6 +403,7 @@ pub fn run_uplift(
     let uplift = significance(&baseline_agg, &lesson_agg, SIGNIFICANCE_FLOOR);
 
     Ok(UpliftReport {
+        answer_only: false,
         schema: 1,
         task_set: set.name.clone(),
         model: model.to_string(),
@@ -424,6 +432,14 @@ pub fn render_uplift_report(report: &UpliftReport) -> String {
             report.task_set, report.model, report.trials
         ),
         String::new(),
+        format!(
+            "Solver mode: {}",
+            if report.answer_only {
+                "answer-only, project context beside the question, no tools"
+            } else {
+                "coding-agent, system context, tools available"
+            }
+        ),
         "| arm | mean | stddev | per-trial | injection |".to_string(),
         "|---|---|---|---|---|".to_string(),
     ];
@@ -489,6 +505,17 @@ pub fn arm_config(lesson_arm: bool) -> String {
     }
 }
 
+/// Bind answer-only presentation and tool availability into configuration
+/// identity. Legacy coding-agent digests remain byte-for-byte unchanged.
+#[must_use]
+pub fn solver_config_digest(memory_digest: &str, answer_only: bool) -> String {
+    if answer_only {
+        text_digest(format!("answer-only-context-v1:{memory_digest}").as_bytes())
+    } else {
+        memory_digest.to_string()
+    }
+}
+
 /// The seed pack as the exact text `--emit-seed-pack` prints, so its digest is
 /// the same for whoever stages it and whoever attests it.
 ///
@@ -547,6 +574,7 @@ fn arm_name(lesson_arm: bool) -> &'static str {
 /// What one arm run is asked to do.
 #[derive(Debug, Clone)]
 pub struct ArmRequest<'a> {
+    pub answer_only: bool,
     pub set: &'a TaskSet,
     pub task_set: TaskSetIdentity,
     pub lesson_arm: bool,
@@ -562,6 +590,8 @@ pub struct ArmRequest<'a> {
 /// One arm's result, with the identity it ran under.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArmFile {
+    #[serde(default)]
+    pub answer_only: bool,
     pub schema: String,
     pub identity: ArmRunIdentity,
     pub result: ArmResult,
@@ -578,7 +608,10 @@ pub fn run_arm_file(
     driver: &mut dyn UpliftDriver,
 ) -> Result<ArmFile, String> {
     assert_grader_selftest()?;
-    let config_digest = assert_staged(workspace, request.lesson_arm)?;
+    let config_digest = solver_config_digest(
+        &assert_staged(workspace, request.lesson_arm)?,
+        request.answer_only,
+    );
     let config = RawArmConfig {
         is_baseline: Some(!request.lesson_arm),
         retrieval: request.lesson_arm,
@@ -603,6 +636,7 @@ pub fn run_arm_file(
         &config,
     )?;
     Ok(ArmFile {
+        answer_only: request.answer_only,
         schema: UPLIFT_ARM_SCHEMA.to_string(),
         identity: ArmRunIdentity {
             binding: request.binding.clone(),
@@ -634,6 +668,8 @@ pub struct ReceiptArm {
 /// bound to the content identity of the run that produced them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpliftReceipt {
+    #[serde(default)]
+    pub answer_only: bool,
     pub schema: String,
     /// Digest of `identity`.
     pub run_id: String,
@@ -654,7 +690,17 @@ pub struct UpliftReceipt {
 /// an arm has no tasks. A broken injection contract is not an error: it is a
 /// void receipt.
 pub fn combine(first: &ArmFile, second: &ArmFile) -> Result<UpliftReceipt, String> {
+    if first.answer_only != second.answer_only {
+        return Err("the arm files use different solver modes".to_string());
+    }
     for file in [first, second] {
+        let memory_digest = text_digest(arm_config(file.identity.arm.is_lesson_arm).as_bytes());
+        if file.identity.arm.config_digest != solver_config_digest(&memory_digest, file.answer_only)
+        {
+            return Err(
+                "the arm file's configuration digest does not match its solver mode".to_string(),
+            );
+        }
         if file.schema != UPLIFT_ARM_SCHEMA {
             return Err(format!(
                 "unsupported arm file schema '{}' (expected {UPLIFT_ARM_SCHEMA})",
@@ -699,6 +745,7 @@ pub fn combine(first: &ArmFile, second: &ArmFile) -> Result<UpliftReceipt, Strin
         .is_empty()
         .then(|| significance(&baseline_agg, &lesson_agg, SIGNIFICANCE_FLOOR));
     Ok(UpliftReceipt {
+        answer_only: first.answer_only,
         schema: UPLIFT_RECEIPT_SCHEMA.to_string(),
         run_id: identity.run_id(),
         identity,
@@ -743,6 +790,7 @@ pub fn render_uplift_receipt(receipt: &UpliftReceipt) -> String {
                 })
                 .collect();
             lines.push(render_uplift_report(&UpliftReport {
+                answer_only: receipt.answer_only,
                 schema: 1,
                 task_set: identity.task_set.name.clone(),
                 model: identity.lessons.model.clone(),
@@ -1011,6 +1059,7 @@ not json at all
 
     fn request(set: &TaskSet, lesson_arm: bool) -> ArmRequest<'_> {
         ArmRequest {
+            answer_only: false,
             set,
             task_set: task_set_identity(set, TASK_SET.as_bytes()),
             lesson_arm,

@@ -4,6 +4,11 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **`uplift --answer-only` measures answers from adjacent project context without
+  tools.** Both solver arms forward the flag to LocalPilot. Arm files and
+  receipts record the mode, configuration identity binds it, and combining
+  different modes is refused. Historical coding-agent receipts remain readable.
+
 - **An uplift turn that stops without an answer fails the arm.** When
   `localpilot print` ends a turn with `ProviderError`, `Degraded`, `Cancelled`,
   `TimedOut` or `Quiesced`, the arm now fails with that reason instead of

@@ -68,6 +68,7 @@ fn representative_uplift_report() -> UpliftReport {
     let lesson_agg = aggregate(&lesson).unwrap();
     let uplift = significance(&baseline_agg, &lesson_agg, 0.05);
     UpliftReport {
+        answer_only: false,
         schema: 1,
         task_set: "headroom-mini".to_string(),
         model: "example-local-model".to_string(),
@@ -182,6 +183,7 @@ fn receipt(used_by_lessons: &str) -> serde_json::Value {
         )
         .unwrap();
         let request = ArmRequest {
+            answer_only: false,
             set: &set,
             task_set: task_set_identity(&set, raw.as_bytes()),
             lesson_arm,

@@ -43,12 +43,14 @@ commands:
                              localpilot learning seed). A mis-staged run VOIDs.
                              --timeout bounds each solver turn (default 600 s);
                              --timeout 0 sets no bound, for a slow local model.
+                             --answer-only uses project context beside the
+                             question without tools, and binds that solver mode.
   uplift --emit-arm-config baseline|lessons
                              print the .localmind.toml an arm's workspace must
                              be staged with
   uplift --task-set <file> --arm baseline|lessons --workspace <dir>
          --model <key> --binding <id> --out <arm-file> [--trials <n>]
-         [--localpilot <bin>] [--timeout <s>] [--intended a,b]
+         [--localpilot <bin>] [--timeout <s>] [--intended a,b] [--answer-only]
                              run ONE arm in a workspace staged for it, and write
                              its arm file. Stage, run the baseline, stage, run
                              the lesson arm; a workspace not staged for the arm
@@ -387,6 +389,7 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let answer_only = args.iter().any(|arg| arg == "--answer-only");
     let set_path = flag_value(args, "--task-set")
         .ok_or("uplift needs --report <file> or --task-set <file>")?;
     let set_bytes = std::fs::read(&set_path)
@@ -425,6 +428,7 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
         let binding = flag_value(args, "--binding").ok_or("uplift --arm needs --binding <id>")?;
         let out = flag_value(args, "--out").ok_or("uplift --arm needs --out <arm-file>")?;
         let request = ArmRequest {
+            answer_only,
             set: &set,
             task_set: task_set_identity(&set, &set_bytes),
             lesson_arm,
@@ -435,6 +439,7 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
             intended: if lesson_arm { intended } else { Vec::new() },
         };
         let mut driver = PrintDriver {
+            answer_only,
             bin,
             workspace: workspace.clone(),
             model,
@@ -448,12 +453,14 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
     }
 
     let mut baseline = PrintDriver {
+        answer_only,
         bin: bin.clone(),
         workspace: workspace.clone(),
         model: model.clone(),
         timeout: std::time::Duration::from_secs(timeout),
     };
     let mut lessons = PrintDriver {
+        answer_only,
         bin,
         workspace,
         model: model.clone(),
@@ -467,7 +474,8 @@ fn cmd_uplift(args: &[String]) -> Result<ExitCode, String> {
          mis-staged run (baseline retrieved memory, or the lesson arm never \
          injected) voids the result. See the operator scripts."
     );
-    let report = run_uplift(&set, &mut baseline, &mut lessons, &intended, trials, &model)?;
+    let mut report = run_uplift(&set, &mut baseline, &mut lessons, &intended, trials, &model)?;
+    report.answer_only = answer_only;
     match output_format(args)? {
         OutputFormat::Json => {
             print_json(&serde_json::to_value(&report).map_err(|e| e.to_string())?)?;

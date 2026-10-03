@@ -6,6 +6,7 @@
   "type": "object",
   "required": ["schema", "run_id", "identity", "arms", "uplift", "void"],
   "properties": {
+    "answer_only": { "type": "boolean", "default": false },
     "schema": { "const": "localbench-uplift-v2" },
     "run_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "identity": {

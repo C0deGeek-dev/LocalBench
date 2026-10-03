@@ -62,12 +62,14 @@ localbench uplift --report <file>
 
 localbench uplift --task-set <file> --workspace <dir> --model <key>
                   [--trials <n>] [--localpilot <bin>] [--timeout <s>]
-                  [--intended <id,id,...>] [--emit-seed-pack]
+                  [--intended <id,id,...>] [--emit-seed-pack] [--answer-only]
     Run the live lesson-on/off A/B via localpilot print (or print the
     seed pack the lesson arm needs). Seed the lesson arm first; the
     injection contract voids a result when an arm did not inject as
     configured. --timeout bounds each solver turn (default 600 s);
-    --timeout 0 sets no bound, for a slow local model.
+    --timeout 0 sets no bound, for a slow local model. --answer-only supplies
+    project context beside the question without tools and binds that solver
+    mode into arm files and receipts. Use the same mode on both arms.
 
 localbench uplift --emit-arm-config baseline|lessons
     Print the .localmind.toml an arm's workspace must be staged with:
@@ -77,7 +79,7 @@ localbench uplift --emit-arm-config baseline|lessons
 localbench uplift --task-set <file> --arm baseline|lessons
                   --workspace <dir> --model <key> --binding <id>
                   --out <arm-file> [--trials <n>] [--localpilot <bin>]
-                  [--timeout <s>] [--intended <id,id,...>]
+                  [--timeout <s>] [--intended <id,id,...>] [--answer-only]
     Run ONE arm in a workspace staged for it and write its arm file. A
     workspace whose .localmind.toml is not the arm's configuration is
     refused before any turn.

@@ -63,6 +63,7 @@ fn stand_in(dir: &Path, workspace: &Path, used: &str) -> PathBuf {
         std::fs::write(
             &path,
             "@echo off\r\n\
+             echo %* > solver-args.txt\r\n\
              findstr /c:\"enabled = true\" .localmind.toml >nul\r\n\
              if errorlevel 1 goto off\r\n\
              copy /y lesson-log.jsonl .localpilot\\sessions\\turn.jsonl >nul\r\n\
@@ -79,6 +80,7 @@ fn stand_in(dir: &Path, workspace: &Path, used: &str) -> PathBuf {
         std::fs::write(
             &path,
             "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" > solver-args.txt\n\
              if grep -q 'enabled = true' .localmind.toml; then\n\
                cp lesson-log.jsonl .localpilot/sessions/turn.jsonl\n\
                echo 'Run foo db sync.'\n\
@@ -128,8 +130,16 @@ impl Fixture {
     }
 
     fn run_arm(&self, arm: &str, binding: &str) -> (Output, PathBuf) {
-        let out = self.dir.path().join(format!("{arm}.json"));
-        let output = localbench(&[
+        self.run_arm_mode(arm, binding, false)
+    }
+
+    fn run_arm_mode(&self, arm: &str, binding: &str, answer_only: bool) -> (Output, PathBuf) {
+        let out = self.dir.path().join(if answer_only {
+            format!("{arm}-answer.json")
+        } else {
+            format!("{arm}.json")
+        });
+        let mut args = vec![
             "uplift",
             "--task-set",
             self.task_set.to_str().unwrap(),
@@ -151,7 +161,11 @@ impl Fixture {
             binding,
             "--out",
             out.to_str().unwrap(),
-        ]);
+        ];
+        if answer_only {
+            args.push("--answer-only");
+        }
+        let output = localbench(&args);
         (output, out)
     }
 
@@ -176,6 +190,51 @@ fn combine(first: &Path, second: &Path, out: &Path) -> Output {
         "--out",
         out.to_str().unwrap(),
     ])
+}
+
+#[test]
+fn answer_only_is_forwarded_bound_rendered_and_cannot_mix_with_legacy_arms() {
+    let fixture = fixture("mem-1");
+    fixture.stage("baseline");
+    let (output, baseline) = fixture.run_arm_mode("baseline", "mode-fixture", true);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        std::fs::read_to_string(fixture.workspace.join("solver-args.txt"))
+            .unwrap()
+            .contains("--answer-only")
+    );
+    let (output, legacy) = fixture.run_arm("baseline", "mode-fixture");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !std::fs::read_to_string(fixture.workspace.join("solver-args.txt"))
+            .unwrap()
+            .contains("--answer-only")
+    );
+    fixture.stage("lessons");
+    let (output, lessons) = fixture.run_arm_mode("lessons", "mode-fixture", true);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        std::fs::read_to_string(fixture.workspace.join("solver-args.txt"))
+            .unwrap()
+            .contains("--answer-only")
+    );
+    let out = fixture.dir.path().join("answer-receipt.json");
+    let mixed = combine(&legacy, &lessons, &out);
+    assert!(!mixed.status.success());
+    assert!(stderr(&mixed).contains("different solver modes"));
+    let paired = combine(&baseline, &lessons, &out);
+    assert!(paired.status.success(), "{}", stderr(&paired));
+    let receipt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(receipt["answer_only"], true);
+    let rendered = localbench(&["uplift", "--report", out.to_str().unwrap()]);
+    assert!(stdout(&rendered).contains("answer-only"));
+    let old: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&legacy).unwrap()).unwrap();
+    assert_ne!(
+        receipt["identity"]["baseline"]["config_digest"],
+        old["identity"]["arm"]["config_digest"]
+    );
 }
 
 #[test]
