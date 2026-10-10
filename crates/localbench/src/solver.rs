@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Stable eval setup failure marker, emitted before grading a denied verifier.
+pub const VERIFICATION_PERMISSION_FAILURE: &str =
+    "evaluation verification permission preflight failed:";
 
 /// One solver invocation's identity and knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,9 +26,10 @@ pub struct SolveSpec {
     pub arm: String,
     /// The per-task id, so every scorecard is labelled per task.
     pub task: String,
-    /// The solver edits its own throwaway task workspace, so `bypass` is the
-    /// default — untrusted-code isolation is the grader's job (a
-    /// network-isolated, read-only container), not the solver's.
+    /// `bypass` is the current default, not an opaque test-command grant.
+    /// Capability runs must establish permission for the project's test
+    /// operation separately. Neither a throwaway workspace nor the isolated
+    /// grader isolates or grants authority to the solver process.
     pub permission: String,
     /// Enable the verify-before-done gate for this run (the verify arm).
     pub verify: bool,
@@ -369,6 +373,12 @@ impl Solver for LocalPilotSolver {
             ));
         }
         if !run.exit_ok {
+            if let Some((_, reason)) = run.stderr.split_once(VERIFICATION_PERMISSION_FAILURE) {
+                return Err(format!(
+                    "{VERIFICATION_PERMISSION_FAILURE} {}",
+                    reason.trim()
+                ));
+            }
             return Err(format!(
                 "'{} eval' failed (arm '{}', task '{}'): {}",
                 self.bin,
@@ -617,6 +627,34 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+
+    #[test]
+    fn the_live_solver_preserves_the_permission_setup_failure_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let (name, script) = ("permission-failure.cmd", format!("@echo off\r\necho Error: {VERIFICATION_PERMISSION_FAILURE} denied verifier 1>&2\r\nexit /b 1\r\n"));
+        #[cfg(unix)]
+        let (name, script) = ("permission-failure.sh", format!("#!/bin/sh\nprintf '%s\\n' 'Error: {VERIFICATION_PERMISSION_FAILURE} denied verifier' >&2\nexit 1\n"));
+        let path = dir.path().join(name);
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut solver = LocalPilotSolver {
+            bin: path.to_str().unwrap().to_string(),
+            timeout: Duration::from_secs(5),
+        };
+        let error = solver
+            .solve(dir.path(), &SolveSpec::new("m", "full", "t", "test"))
+            .unwrap_err();
+        assert!(
+            error.starts_with(VERIFICATION_PERMISSION_FAILURE),
+            "{error}"
+        );
+        assert!(error.contains("denied verifier"));
     }
 
     #[test]

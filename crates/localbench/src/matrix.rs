@@ -30,7 +30,7 @@ use localbench_measure::runner::{
 };
 
 use crate::output::RunEvent;
-use crate::solver::{run_bounded, SolveSpec, Solver};
+use crate::solver::{run_bounded, SolveSpec, Solver, VERIFICATION_PERMISSION_FAILURE};
 
 /// One arm of the matrix.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -747,6 +747,16 @@ pub fn run_matrix(
             let raw = match solver.solve(Path::new(&task.workspace), &solve_spec) {
                 Ok(raw) => raw,
                 Err(reason) => {
+                    if reason.starts_with(VERIFICATION_PERMISSION_FAILURE) {
+                        log(&format!(
+                            "task '{}': invalid permission baseline; {reason}",
+                            task.id
+                        ));
+                        caveats.push("Capability comparison invalid: the project's verifier was not permitted; configure its exact user command grant and rerun.".to_string());
+                        results.clear();
+                        aborted = Some(reason);
+                        break 'arms;
+                    }
                     // A failing or hung cell is isolated: record it unsolved so
                     // the arm still aggregates and the matrix completes — and
                     // persist it so `rescore` sees the same cell the live report
@@ -999,6 +1009,44 @@ mod tests {
             learn: false,
             coach: None,
         }
+    }
+
+    #[test]
+    fn denied_verification_invalidates_the_comparison_without_a_failed_cell() {
+        struct PermissionBlocked(usize);
+        impl Solver for PermissionBlocked {
+            fn solve(&mut self, _workspace: &Path, spec: &SolveSpec) -> Result<String, String> {
+                self.0 += 1;
+                assert_eq!(spec.permission, "bypass");
+                Err(format!("{VERIFICATION_PERMISSION_FAILURE} opaque test operation requires its user grant"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut solver = PermissionBlocked(0);
+        let spec = spec_with(vec![arm("full"), arm("fair")], vec![task("t1"), task("t2")]);
+        let mut events = Vec::new();
+        let result = run_matrix(
+            &mut solver,
+            &mut NoGrader,
+            &spec,
+            dir.path(),
+            &mut |_| {},
+            &mut |event| events.push(event.clone()),
+        )
+        .unwrap();
+        assert_eq!(solver.0, 1, "do not spend on more invalid baseline cells");
+        assert_eq!(result.cells_saved, 0);
+        assert!(result.report.arms.is_empty());
+        assert!(result
+            .aborted
+            .unwrap()
+            .starts_with(VERIFICATION_PERMISSION_FAILURE));
+        assert!(result.caveats[0].contains("comparison invalid"));
+        assert!(matches!(events.last(), Some(RunEvent::Error { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, RunEvent::Result { .. } | RunEvent::Completed { .. })));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

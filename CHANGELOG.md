@@ -4,6 +4,13 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **Permission-blocked verification invalidates capability comparisons.** The
+  solver keeps `bypass` and preserves LocalPilot's eval test-access failure
+  diagnostic. The matrix stops with a setup error/caveat and does not persist a
+  denied verifier as an unsolved model cell. Explicit user test grants and a
+  matching project verification command establish test access across arms.
+
+
 - **`uplift --answer-only` measures answers from adjacent project context without
   tools.** Both solver arms forward the flag to LocalPilot. Arm files and
   receipts record the mode, configuration identity binds it, and combining

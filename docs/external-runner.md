@@ -61,6 +61,31 @@ workspace under a wall-clock bound (`--solver-timeout`, default 600 s); a
 hung or failing cell is killed and recorded as an unsolved card, never
 aborting the matrix.
 
+### Project Test Permission Is A Baseline Prerequisite
+
+The live solver continues to pass `--permission bypass`; it does not grant
+opaque script/interpreter targets headlessly. Before comparing capability arms,
+configure the project's exact host test operation in `[harness].verify_command`
+and supply a matching **user-owned** `[[permissions.allow_commands]]` entry.
+Project configuration cannot grant itself authority. For example, select
+`python -m unittest discover -s tests` as the verifier and grant program `python`
+with that exact args prefix in the user file. Use the same test operation and
+grants across arms, and record this posture with the run configuration.
+
+LocalPilot eval preflights that target (or its detected target) before a model
+request, sends the admitted structured program/args to the model, and rechecks
+permissions during execution. Setup checks run no tests. A denied preflight or
+actual verifier emits no scorecard and a stable permission-setup diagnostic.
+LocalBench aborts the comparison with an error and caveat, rather than saving a
+permission-blocked cell as an unsolved model task. Already persisted valid cells
+remain available; an aborted comparison is not a completed capability report.
+
+The Docker grader's test success does not prove tests were reachable inside the
+agent. It grades separately and does not isolate the host solver. Correct the
+grant/verification target and rerun permission-blocked historical baselines.
+Use a LocalPilot build with the eval permission preflight; older solvers cannot
+provide that setup guarantee.
+
 ## Clean-room boundary
 
 > **The copied public corpus is never written under a LocalPilot checkout.**
