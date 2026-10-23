@@ -4,6 +4,10 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- Update the shared async runtime to Tokio1.51.6 and the TLS security fixes
+  while preserving Rust1.82 and existing runtime features. Guard the audit
+  exceptions for unbuilt optional QUIC dependencies against activation.
+
 - **Permission-blocked verification invalidates capability comparisons.** The
   solver keeps `bypass` and preserves LocalPilot's eval test-access failure
   diagnostic. The matrix stops with a setup error/caveat and does not persist a

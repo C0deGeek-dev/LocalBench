@@ -47,7 +47,7 @@ thiserror = "=2.0.9"
 regex = "=1.11.3"
 tempfile = "=3.14.0"
 toml = "=0.8.23"
-tokio = { version = "=1.44.2", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "=1.51.6", features = ["macros", "rt-multi-thread", "net", "time"] }
 reqwest = { version = "=0.12.11", features = ["json", "stream", "rustls-tls"], default-features = false }
 sysinfo = "=0.32.1"
 # The localx-llama pins and localbox-launcher move together: the graph must
@@ -55,8 +55,8 @@ sysinfo = "=0.32.1"
 # Launcher trait — the diamond-dep breakage), so advance the -core/-runtime
 # revs only together with a localbox-launcher re-pin whose own -core pin
 # matches.
-localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "123d8b8fcc1b047caa514de4ad2be353750f3c1c" }
-localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "123d8b8fcc1b047caa514de4ad2be353750f3c1c" }
-localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "123d8b8fcc1b047caa514de4ad2be353750f3c1c" }
-localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "c6ffe6e225663e2c2b4a66dff82303c38f3823ad" }
+localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "b6b1bf2e6ea348e41166af6860d1fc5605a77ee9" }
+localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "b6b1bf2e6ea348e41166af6860d1fc5605a77ee9" }
+localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "b6b1bf2e6ea348e41166af6860d1fc5605a77ee9" }
+localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "1b19c36a3575aac7fcb44a7be98e15ead3e40b12" }
 
