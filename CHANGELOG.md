@@ -4,6 +4,10 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+## v6.0.0 - 2026-10-26
+
+Coordinated LocalX release.
+
 - Update the shared async runtime to Tokio1.51.6 and the TLS security fixes
   while preserving Rust1.82 and existing runtime features. Guard the audit
   exceptions for unbuilt optional QUIC dependencies against activation.

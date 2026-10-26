@@ -5,7 +5,7 @@
   <p><strong>Find the fastest stable local-model settings for your machine.</strong></p>
   <p><a href="#install-localx">Install</a> · <a href="#tune-a-model-you-already-use">First use</a> · <a href="#updates-and-troubleshooting">Updates &amp; help</a> · <a href="docs/README.md">All guides</a></p>
   <p>
-    <img alt="LocalX release train 5.0.0" src="https://img.shields.io/badge/release%20train-v5.0.0-f0b75a?style=flat-square">
+    <img alt="LocalX release train 6.0.0" src="https://img.shields.io/badge/release%20train-v6.0.0-f0b75a?style=flat-square">
     <img alt="Rust" src="https://img.shields.io/badge/platform-Rust-4d8df7?style=flat-square">
     <img alt="llama.cpp runtime" src="https://img.shields.io/badge/runtime-llama.cpp-59636e?style=flat-square">
     <img alt="GitHub stars" src="https://img.shields.io/github/stars/C0deGeek-dev/LocalBench?style=flat-square&amp;label=stars">

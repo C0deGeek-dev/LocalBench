@@ -803,7 +803,7 @@ checksum = "23fb14cb19457329c82206317a5663005a4d404783dc74f4252769b0d5f42856"
 
 [[package]]
 name = "localbench"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "jsonschema",
  "localbench-measure",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "localbench-measure"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "localbench-scoring",
  "localbench-search",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "localbench-scoring"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "localx-eval-core",
  "regex",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "localbench-search"
-version = "5.0.0"
+version = "6.0.0"
 dependencies = [
  "localbench-scoring",
  "serde",
