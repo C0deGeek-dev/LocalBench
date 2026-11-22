@@ -65,7 +65,7 @@ impl<'a> LiveBenchScreen<'a> {
         target: TrialTarget,
         optimize: Optimize,
     ) -> Option<Self> {
-        let server = launcher.server_binary(target.mode, true).ok()?;
+        let server = target.server_binary(launcher).ok()?;
         let binary = server.with_file_name(bench_exe_name());
         binary.is_file().then_some(Self {
             launcher,
@@ -246,10 +246,7 @@ impl LiveBenchScreen<'_> {
 
 impl BenchScreen for LiveBenchScreen<'_> {
     fn rank(&mut self, candidates: &[Overrides]) -> Option<Vec<usize>> {
-        let load = self
-            .launcher
-            .server_capabilities(self.target.mode)
-            .load_flags();
+        let load = self.target.server_capabilities(self.launcher).load_flags();
         let shapes: Vec<Option<BenchShape>> = candidates
             .iter()
             .map(|overrides| {

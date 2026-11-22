@@ -22,6 +22,7 @@ pub mod gguf;
 pub mod matrix;
 pub mod oracle;
 pub mod output;
+pub mod runtime;
 pub mod screen;
 pub mod solver;
 pub mod trial;

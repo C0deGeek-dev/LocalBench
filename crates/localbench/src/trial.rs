@@ -39,6 +39,7 @@ pub const RESPONSE_SCHEMA: &str =
     "choices[0].message.content+timings.prompt_per_second+timings.predicted_per_second";
 const MAX_DIAGNOSTIC_CHARS: usize = 2_048;
 const CHAT_PROMPT_TARGET_TOKENS: u32 = 512;
+const CHAT_REPLY_TOKENS: u32 = 256;
 
 /// Measures one candidate config; the tuner is blind to how.
 pub trait TrialRunner {
@@ -63,6 +64,47 @@ pub struct TrialTarget {
     pub log_dir: PathBuf,
     /// LocalBox settings overlay applied under candidate-owned values.
     pub settings_params: LaunchParams,
+    pub runtime: Option<crate::runtime::BenchmarkRuntime>,
+}
+
+impl TrialTarget {
+    #[must_use]
+    pub fn reply_token_limit(&self) -> u32 {
+        if self.runtime.is_some() {
+            // Inkling may spend more than 256 tokens reasoning about the
+            // coding-agent fixture even with its effort set to none.
+            1024
+        } else {
+            CHAT_REPLY_TOKENS
+        }
+    }
+
+    pub(crate) fn server_binary(
+        &self,
+        launcher: &dyn Launcher,
+    ) -> Result<PathBuf, localx_llama_core::LauncherError> {
+        self.runtime.as_ref().map_or_else(
+            || launcher.server_binary(self.mode, true),
+            |runtime| Ok(runtime.server.clone()),
+        )
+    }
+
+    pub(crate) fn server_capabilities(
+        &self,
+        launcher: &dyn Launcher,
+    ) -> localx_llama_core::ServerCapabilities {
+        self.runtime.as_ref().map_or_else(
+            || launcher.server_capabilities(self.mode),
+            |runtime| runtime.capabilities,
+        )
+    }
+
+    pub(crate) fn fit_params_binary(&self, launcher: &dyn Launcher) -> Option<PathBuf> {
+        self.runtime.as_ref().map_or_else(
+            || launcher.fit_params_binary(self.mode),
+            |runtime| localx_llama_runtime::fit::fit_params_beside(&runtime.server),
+        )
+    }
 }
 
 /// The live [`TrialRunner`] over the launcher contract.
@@ -124,7 +166,10 @@ pub fn candidate_launch_params(
     )
     .map_err(|error| error.to_string())?;
     let mut params = trial_launch_params(typed.to_launch_params(), &target.settings_params);
-    params.load_flags = launcher.server_capabilities(target.mode).load_flags();
+    params.load_flags = target.server_capabilities(launcher).load_flags();
+    if let Some(runtime) = &target.runtime {
+        runtime.apply_batch_defaults(&mut params);
+    }
     Ok(params)
 }
 
@@ -141,6 +186,8 @@ pub fn session_fingerprint(params: &LaunchParams) -> BTreeMap<String, serde_json
     insert_i64("parallel", params.parallel);
     insert_i64("cache_reuse", params.cache_reuse);
     insert_i64("n_cpu_moe", params.n_cpu_moe);
+    insert_i64("batch_size", params.batch_size);
+    insert_i64("ubatch_size", params.ubatch_size);
     if let Some(value) = params.mlock {
         values.insert("mlock".to_string(), value.into());
     }
@@ -170,14 +217,14 @@ struct ChatMeasurementRequest<'a> {
 /// Build the deterministic request body whose shape participates in the cache
 /// fingerprint. The full prompt is never written to diagnostics.
 #[must_use]
-pub fn chat_measurement_request() -> serde_json::Value {
+pub fn chat_measurement_request(max_tokens: u32) -> serde_json::Value {
     let prompt = coding_agent_stress_prompt(CHAT_PROMPT_TARGET_TOKENS);
     serde_json::to_value(ChatMeasurementRequest {
         messages: [ChatMessage {
             role: "user",
             content: &prompt,
         }],
-        max_tokens: 256,
+        max_tokens,
         temperature: 0,
         top_p: 1,
         seed: 0,
@@ -199,11 +246,11 @@ pub fn chat_prompt_hash() -> String {
 
 /// Stable request-shape hash without persisting the generated prompt.
 #[must_use]
-pub fn chat_request_shape_hash() -> String {
+pub fn chat_request_shape_hash(max_tokens: u32) -> String {
     stable_json_hash(&serde_json::json!({
         "path": "/v1/chat/completions",
         "messages": [{"role": "user", "content": "stress-prompt-512"}],
-        "max_tokens": 256,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "top_p": 1,
         "seed": 0,
@@ -842,7 +889,7 @@ fn collect_host_telemetry<T>(operation: impl FnOnce() -> T) -> (T, Telemetry) {
 impl LiveRunner<'_> {
     fn measure_once(&self, port: u16) -> Result<ChatMeasurement, TrialFailure> {
         let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-        let body = chat_measurement_request();
+        let body = chat_measurement_request(self.target.reply_token_limit());
         let runtime = tokio::runtime::Runtime::new().map_err(|error| {
             failure(
                 TrialFailureStage::Request,
@@ -1124,7 +1171,7 @@ impl TrialRunner for LiveRunner<'_> {
                 return launch_failed(TrialFailureReason::ArgumentConstruction, error.to_string())
             }
         };
-        let binary = match self.launcher.server_binary(target.mode, true) {
+        let binary = match target.server_binary(self.launcher) {
             Ok(binary) => binary,
             Err(error) => {
                 return launch_failed(TrialFailureReason::BinaryUnavailable, error.to_string())
@@ -1432,12 +1479,17 @@ mod tests {
 
     #[test]
     fn chat_request_has_no_raw_completion_fallback() {
-        let request = chat_measurement_request();
+        let request = chat_measurement_request(CHAT_REPLY_TOKENS);
         assert!(request.get("messages").is_some());
         assert_eq!(request["max_tokens"], 256);
         assert_eq!(request["temperature"], 0);
         assert!(request.get("prompt").is_none());
         assert!(request.get("n_predict").is_none());
+        assert_eq!(chat_measurement_request(1024)["max_tokens"], 1024);
+        assert_ne!(
+            chat_request_shape_hash(1024),
+            chat_request_shape_hash(CHAT_REPLY_TOKENS)
+        );
         let content = request["messages"][0]["content"].as_str().unwrap();
         assert!(content.contains("Support reliable llama.cpp benchmarking for a local MoE model"));
         let repeated_key_prompt = localbench_measure::prompt::stress_prompt(
@@ -1450,7 +1502,7 @@ mod tests {
 
     #[test]
     fn prompt_fingerprint_hashes_the_exact_shipped_content() {
-        let request = chat_measurement_request();
+        let request = chat_measurement_request(CHAT_REPLY_TOKENS);
         assert_eq!(
             chat_prompt_hash(),
             stable_json_hash(&serde_json::json!({
@@ -2110,6 +2162,7 @@ mod tests {
                 port_start: 0,
                 log_dir,
                 settings_params: LaunchParams::default(),
+                runtime: None,
             },
             startup_timeout_secs,
             "test-run",

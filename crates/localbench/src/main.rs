@@ -638,7 +638,8 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
     let key = flag_value(args, "--model").ok_or("findbest needs --model <key>")?;
     let context_key = flag_value(args, "--context").unwrap_or_default();
     let requested_mode = parse_mode(flag_value(args, "--mode").as_deref())?;
-    let profile = match flag_value(args, "--profile").as_deref() {
+    let profile_arg = flag_value(args, "--profile");
+    let mut profile = match profile_arg.as_deref() {
         None | Some("pure") => ScoreProfile::Pure,
         Some("balanced") => ScoreProfile::Balanced,
         Some("both") => ScoreProfile::Both,
@@ -698,7 +699,7 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
     consumer::assert_launcher_usable(&launcher.version(), "1.0.0").map_err(|e| e.to_string())?;
 
     let mode = resolve_mode(&key, requested_mode, launcher.required_mode(&key))?;
-    let def = launcher.model_def(&key).map_err(|e| e.to_string())?;
+    let mut def = launcher.model_def(&key).map_err(|e| e.to_string())?;
     let resolved_context = localx_llama_core::model::resolve_context_key(&def, &context_key)
         .map_err(|e| e.to_string())?;
     let context_tokens = localx_llama_core::model::context_value(&def, &resolved_context)
@@ -730,6 +731,29 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
     // a dense model is misclassified as MoE and swept on the no-op `--n-cpu-moe`
     // axis until it runs out of candidates with no winner (LocalHub#76).
     let shape = localbench::gguf::read_model_shape(&gguf);
+    let runtime = if shape.looped_inkling {
+        if mode != localx_llama_core::Mode::Native {
+            return Err(format!(
+                "{key} requires the Inkling 2 runtime (--mode native)"
+            ));
+        }
+        let (runtime, model) = localbench::runtime::BenchmarkRuntime::resolve(&key)?;
+        eprintln!("Benchmark runtime: {}", runtime.build_identity);
+        def = model;
+        if profile_arg.is_none() {
+            profile = ScoreProfile::Balanced;
+        }
+        Some(runtime)
+    } else {
+        None
+    };
+    let runtime_build = runtime
+        .as_ref()
+        .map(|runtime| runtime.build_identity.clone());
+    let capabilities = runtime.as_ref().map_or_else(
+        || launcher.server_capabilities(mode),
+        |runtime| runtime.capabilities,
+    );
     // Catalog `ExtraArgs` follow every candidate value on the server command
     // line and keep winning at launch, so the axes they pin are not searched
     // (LocalHub#200).
@@ -743,9 +767,9 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
     let space = resolve_search_space(
         &ModelAxes {
             n_cpu_moe: def.n_cpu_moe,
-            config_n_cpu_moe: None,
+            config_n_cpu_moe: runtime.as_ref().map(|_| 0),
             n_gpu_layers: def.n_gpu_layers,
-            moe_expert_layers: None,
+            moe_expert_layers: runtime.as_ref().map(|_| shape.block_count),
             spec_type: def.spec_type.clone(),
             spec_draft_n_max: None,
             skip_phases: pinned.iter().map(|pin| pin.phase.to_string()).collect(),
@@ -753,9 +777,17 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         shape.expert_count,
         shape.block_count,
     );
-    let baseline_kv = KvPair {
-        k: def.kv_cache_k.clone().unwrap_or_else(|| "q8_0".to_string()),
-        v: def.kv_cache_v.clone().unwrap_or_else(|| "q8_0".to_string()),
+    let baseline_kv = if runtime.is_some() {
+        let cache = launcher.kv_types(&def);
+        KvPair {
+            k: cache.k,
+            v: cache.v,
+        }
+    } else {
+        KvPair {
+            k: def.kv_cache_k.clone().unwrap_or_else(|| "q8_0".to_string()),
+            v: def.kv_cache_v.clone().unwrap_or_else(|| "q8_0".to_string()),
+        }
     };
     let cores = u32::try_from(
         std::thread::available_parallelism()
@@ -784,7 +816,10 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         spec_ngram: def.spec_type.is_none() && def.draft_module.is_none(),
     };
     let settings_params = launcher.settings_launch_params();
-    let session_defaults = trial_launch_params(Default::default(), &settings_params);
+    let mut session_defaults = trial_launch_params(Default::default(), &settings_params);
+    if let Some(runtime) = &runtime {
+        runtime.apply_batch_defaults(&mut session_defaults);
+    }
     let run_id = format!("{}-{}", now_iso(), std::process::id());
     let log_dir = local_llm.join("logs").join("tuner");
     let target = TrialTarget {
@@ -797,7 +832,9 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         port_start: 8091,
         log_dir: log_dir.clone(),
         settings_params,
+        runtime,
     };
+    let request_shape_hash = chat_request_shape_hash(target.reply_token_limit());
     // llama.cpp's memory fitter bounds the search unless the build lacks it
     // or `--no-oracle` asks for the trial-only search.
     let mut oracle = if args.iter().any(|a| a == "--no-oracle") {
@@ -838,7 +875,7 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         tuner_version: CURRENT_TUNER_VERSION.to_string(),
         measurement_protocol: MEASUREMENT_PROTOCOL.to_string(),
         telemetry_protocol: TELEMETRY_PROTOCOL.to_string(),
-        request_shape_hash: chat_request_shape_hash(),
+        request_shape_hash,
         chat_template_hash: stable_json_hash(&serde_json::json!({
             "parser": def.parser,
             "chat_template": def.chat_template,
@@ -857,13 +894,18 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
         prompt_length: "short".to_string(),
         prompt_hash: chat_prompt_hash(),
         optimize: flag_value(args, "--optimize").unwrap_or_else(|| "coding-agent".to_string()),
-        profile: flag_value(args, "--profile").unwrap_or_else(|| "pure".to_string()),
+        profile: match profile {
+            ScoreProfile::Pure => "pure",
+            ScoreProfile::Balanced => "balanced",
+            ScoreProfile::Both => "both",
+        }
+        .to_string(),
         search_strategy: "beam".to_string(),
         beam_width: u32::try_from(beam_width).unwrap_or(u32::MAX),
         runs: u32::try_from(runs).unwrap_or(0),
         vram_gb: probe_vram_gb(),
         gpu_names: probe_gpu_names(),
-        llamacpp_build: probe_llamacpp_build(&launcher, mode),
+        llamacpp_build: runtime_build.unwrap_or_else(|| probe_llamacpp_build(&launcher, mode)),
         gguf: GgufIdentity {
             path: gguf.to_string_lossy().to_string(),
             size_bytes: gguf_meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0),
@@ -922,11 +964,7 @@ fn cmd_findbest(args: &[String]) -> Result<ExitCode, String> {
             available_ram_gb: probe_available_ram_gb(),
             gguf_size_gb: gguf_total_size_gb(&gguf),
             commit_available_gb: probe_commit_available_gb(),
-            lazy_mapped_gb: lazy_mapped_gb(
-                &gguf,
-                launcher.server_capabilities(mode).lazy_mode,
-                &def.extra_args,
-            ),
+            lazy_mapped_gb: lazy_mapped_gb(&gguf, capabilities.lazy_mode, &def.extra_args),
             // The Windows display driver backs device memory with host commit.
             vram_backed_by_host_commit: cfg!(windows),
         },

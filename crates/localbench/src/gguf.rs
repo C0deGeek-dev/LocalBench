@@ -33,6 +33,8 @@ pub struct ModelShape {
     /// The model's transformer layer count (`<arch>.block_count`), or `0` when
     /// unknown.
     pub block_count: i64,
+    /// Original Inkling 2 format whose block count records visits.
+    pub looped_inkling: bool,
 }
 
 impl ModelShape {
@@ -40,6 +42,7 @@ impl ModelShape {
     pub const UNKNOWN: ModelShape = ModelShape {
         expert_count: -1,
         block_count: 0,
+        looped_inkling: false,
     };
 }
 
@@ -194,11 +197,24 @@ fn parse<R: Read>(reader: &mut R) -> Option<ModelShape> {
             .map(|(_, v)| *v)
     };
 
+    let mut block_count = by_suffix("block_count").unwrap_or(0);
+    let looped_inkling =
+        arch == "inkling2" && by_suffix("num_loops").is_some_and(|loops| loops > 1);
+    if looped_inkling {
+        let repeats = by_suffix("num_loops")?.checked_sub(1)?;
+        let width = by_suffix("loop.core_end")?.checked_sub(by_suffix("loop.core_start")?)?;
+        let physical_blocks = block_count.checked_sub(repeats.checked_mul(width)?)?;
+        if width <= 0 || physical_blocks <= 0 {
+            return None;
+        }
+        block_count = physical_blocks;
+    }
     Some(ModelShape {
         // A file that was read far enough to name its architecture but carries no
         // expert count is dense (0), which is authoritative — not `-1` "unknown".
         expert_count: by_suffix("expert_count").unwrap_or(0),
-        block_count: by_suffix("block_count").unwrap_or(0),
+        block_count,
+        looped_inkling,
     })
 }
 
@@ -382,6 +398,24 @@ mod tests {
         let shape = parse(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(shape.expert_count, 128);
         assert_eq!(shape.block_count, 48);
+    }
+
+    #[test]
+    fn inkling_loop_visits_resolve_to_physical_expert_layers() {
+        let bytes = gguf(
+            &[("general.architecture", "inkling2")],
+            &[
+                ("inkling2.block_count", 48),
+                ("inkling2.expert_count", 128),
+                ("inkling2.num_loops", 3),
+                ("inkling2.loop.core_start", 6),
+                ("inkling2.loop.core_end", 18),
+            ],
+        );
+        let shape = parse(&mut Cursor::new(bytes)).unwrap();
+        assert!(shape.looped_inkling);
+        assert_eq!(shape.block_count, 24);
+        assert_eq!(shape.expert_count, 128);
     }
 
     #[test]

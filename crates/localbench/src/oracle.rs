@@ -46,7 +46,7 @@ impl<'a> LiveFitOracle<'a> {
     /// An oracle for `target`, when its engine ships `llama-fit-params`.
     #[must_use]
     pub fn new(launcher: &'a dyn Launcher, target: TrialTarget, margin_mib: u32) -> Option<Self> {
-        let binary = launcher.fit_params_binary(target.mode)?;
+        let binary = target.fit_params_binary(launcher)?;
         Some(Self {
             launcher,
             target,
