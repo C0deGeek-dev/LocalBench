@@ -4,6 +4,16 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **A 256k tune of a large MoE model no longer ends on four OOM trials.** The
+  memory-fit oracle no longer reports "fits" when `llama-fit-params` found no
+  placement (`-ngl 0`); it reports the shortfall and tries smaller memory
+  shapes first (batch sizes 256 to 32, with and without the new `NoOpOffload`
+  override, which stores and replays `--no-op-offload`) before any server
+  starts. A fit that keeps fewer layers than the whole model on the GPU is not
+  read as an expert count, a shape short of free memory by more than the margin
+  is skipped instead of tried, and OOM recovery ends on the placement that keeps
+  the most off the GPU. LocalHub#302.
+
 ## v6.0.0 - 2026-10-26
 
 Coordinated LocalX release.

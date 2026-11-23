@@ -18,7 +18,7 @@ use localx_llama_core::Launcher;
 use localx_llama_runtime::fit::{run_fit_params, FitRunError};
 
 use crate::trial::{candidate_launch_params, TrialTarget};
-use crate::tuner::FitOracle;
+use crate::tuner::{FitOracle, NoFit};
 
 /// Free VRAM the fitter keeps per device: llama.cpp's own `--fit` default.
 /// The VRAM-fit phase probes past it, so this sets where the search starts,
@@ -95,16 +95,46 @@ impl LiveFitOracle<'_> {
     }
 }
 
+/// The shortfall in a fitter answer that found no placement.
+fn no_fit_of(answer: &Result<FitPlacement, FitRunError>) -> Option<NoFit> {
+    match answer {
+        Err(FitRunError::Fit(FitError::NoPlacement { deficit_mib })) => Some(NoFit {
+            deficit_mib: *deficit_mib,
+        }),
+        _ => None,
+    }
+}
+
+/// Why a shape is not worth a server trial, when the fitter said so.
+///
+/// A failure is reported as it came. A shape with no placement is skipped only
+/// when it is short by more than the free-memory margin the fitter keeps: the
+/// fitter's deficit includes that margin, so a smaller one may still start,
+/// and the search probes past the fitted edge for exactly that reason.
+fn rejection_of(answer: &Result<FitPlacement, FitRunError>, margin_mib: u32) -> Option<String> {
+    match answer {
+        Err(FitRunError::Fit(FitError::Failed(reason))) => Some(reason.clone()),
+        Err(FitRunError::Fit(FitError::NoPlacement {
+            deficit_mib: Some(deficit),
+        })) if *deficit > u64::from(margin_mib) => Some(format!(
+            "no placement fits: {} MiB more device memory than is free",
+            deficit - u64::from(margin_mib)
+        )),
+        _ => None,
+    }
+}
+
 impl FitOracle for LiveFitOracle<'_> {
     fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement> {
         self.answer(overrides).ok()
     }
 
+    fn no_placement(&mut self, overrides: &Overrides) -> Option<NoFit> {
+        no_fit_of(&self.answer(overrides))
+    }
+
     fn rejection(&mut self, overrides: &Overrides) -> Option<String> {
-        match self.answer(overrides) {
-            Err(FitRunError::Fit(FitError::Failed(reason))) => Some(reason),
-            _ => None,
-        }
+        rejection_of(&self.answer(overrides), self.margin_mib)
     }
 }
 
@@ -114,6 +144,41 @@ mod tests {
     use super::*;
     use localbench_search::overrides::overrides_of;
     use serde_json::json;
+
+    fn no_placement(deficit_mib: Option<u64>) -> Result<FitPlacement, FitRunError> {
+        Err(FitRunError::Fit(FitError::NoPlacement { deficit_mib }))
+    }
+
+    #[test]
+    fn a_fit_with_no_placement_is_reported_as_a_shortfall_not_a_fit() {
+        assert_eq!(
+            no_fit_of(&no_placement(Some(29819))),
+            Some(NoFit {
+                deficit_mib: Some(29819)
+            })
+        );
+        assert_eq!(
+            no_fit_of(&Err(FitRunError::DidNotRun)),
+            None,
+            "no answer is not a shortfall"
+        );
+    }
+
+    #[test]
+    fn a_shape_short_by_more_than_the_margin_is_skipped_and_a_near_miss_is_tried() {
+        // The fitter's deficit includes the 1024 MiB it keeps free.
+        let reason = rejection_of(&no_placement(Some(29819)), 1024).unwrap();
+        assert!(reason.contains("28795 MiB more device memory"), "{reason}");
+        assert_eq!(rejection_of(&no_placement(Some(900)), 1024), None);
+        assert_eq!(rejection_of(&no_placement(None), 1024), None);
+        assert_eq!(
+            rejection_of(
+                &Err(FitRunError::Fit(FitError::Failed("boom".to_string()))),
+                1024
+            ),
+            Some("boom".to_string())
+        );
+    }
 
     #[test]
     fn placement_and_threads_do_not_change_the_memory_shape() {

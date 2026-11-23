@@ -59,7 +59,20 @@ an oracle for *where* a candidate fits, never for how fast it runs:
 
 - **baseline** starts at the fitted placement (`NCpuMoe` for a MoE model,
   `NGpuLayers` for a dense one that does not fit whole) instead of the
-  catalog default;
+  catalog default. When the fitter finds **no placement at all** for the
+  baseline shape (it falls back to `-ngl 0`: even the dense weights, the
+  context and the compute buffer do not fit), the run says how many MiB short
+  it is and tries smaller memory shapes before any server starts. It asks the
+  fitter about each in turn, largest batch first (`UbatchSize`/`BatchSize` 256,
+  128, 64, 32), each first as it is and then with `NoOpOffload` — host (MoE
+  expert) operations stay on the CPU instead of being staged through the GPU,
+  which for a long context removes the larger compute buffer — and the first
+  shape with a placement becomes the baseline. A placement that keeps fewer
+  than all layers on the GPU is not one `NCpuMoe` can express, so it does not
+  count either. Axes the catalog pins in `ExtraArgs` are not varied. If no
+  shape fits and the shortfall is more than the free-memory margin, the run
+  stops with the shortfall instead of spending OOM trials; a shortfall inside
+  the margin is searched by trial;
 - **vram-fit** probes past it one step at a time (one expert block for a MoE
   model, one layer for a dense one) — the fitter keeps about 1 GiB free per
   device, so more of the model often still starts — and stops at the first
@@ -68,7 +81,9 @@ an oracle for *where* a candidate fits, never for how fast it runs:
   overcommitted VRAM into system memory instead of failing, and such a server
   runs at a fraction of the speed. If the fitted placement itself runs out of
   memory it backs off one step at a time (at most three) and says so. The
-  distance this host runs from the fitted edge carries into later phases;
+  distance this host runs from the fitted edge carries into later phases. If
+  those steps do not start either, it tries the placement that keeps the most
+  off the GPU once, so the run has a measurement to search from;
 - a later phase that changes the memory shape (KV type, batch size, flash
   attention, cache or memory flags) keeps its intent but gets the placement
   that shape needs, instead of spending a trial proving the old one no
@@ -77,7 +92,8 @@ an oracle for *where* a candidate fits, never for how fast it runs:
   every layer on the GPU with a turbo cache. Refinement is the exception: it
   measures placements next to the edge on purpose;
 - a candidate llama.cpp cannot create at all (for example a quantized V
-  cache without flash attention) is skipped with the fitter's reason
+  cache without flash attention), or one with no placement that is short of
+  free memory by more than the margin, is skipped with the fitter's reason
   instead of spending a trial on a server that cannot start;
 - **refine** measures only the neighbours (±2) of the retained placement.
 
@@ -251,6 +267,9 @@ keys:
 - `UbatchSize` / `BatchSize` — llama.cpp `--ubatch-size` / `--batch-size`.
 - `Threads` / `ThreadsBatch` — llama.cpp `--threads` / `--threads-batch`.
 - `FlashAttn` — flash-attention on/off.
+- `NoOpOffload` — llama.cpp `--no-op-offload`: host tensor operations stay on
+  the CPU. Chosen by the shape rescue when a long context does not fit
+  otherwise; stored in the profile and replayed by LocalBox.
 - `Mlock` / `NoMmap` — lock the model in RAM / load it without mmap; see
   **memory-flags** above for how each build spells them.
 - `KvK` / `KvV` — KV-cache types for keys/values, passed as `-ctk` / `-ctv`.

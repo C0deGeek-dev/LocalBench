@@ -23,8 +23,8 @@ use localbench_search::space::{
     baseline_recovery_seed, dense_recovery_candidates, expand_phase_candidates,
     fine_tune_n_cpu_moe_candidates, kv_candidate_pairs, moe_candidate_values,
     moe_coverage_worklist, moe_edge_refine_values, recovery_n_cpu_moe_candidates,
-    resolve_allowed_kv_types, resolve_tuner_budget, seed_failed, swa_flag_overlays, KvPair,
-    SearchSpace,
+    resolve_allowed_kv_types, resolve_tuner_budget, seed_failed, shape_rescue_candidates,
+    swa_flag_overlays, KvPair, SearchSpace,
 };
 use localx_llama_core::fit::FitPlacement;
 use serde_json::json;
@@ -66,6 +66,20 @@ pub struct TunerOutcome {
 /// Default number of candidate lineages retained between phases.
 pub const DEFAULT_BEAM_WIDTH: usize = 3;
 
+/// A memory shape the fitter could not place at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoFit {
+    /// How much more device memory the shape needs, when the fitter said.
+    pub deficit_mib: Option<u64>,
+}
+
+impl NoFit {
+    fn short(self) -> String {
+        self.deficit_mib
+            .map_or_else(String::new, |deficit| format!(" ({deficit} MiB short)"))
+    }
+}
+
 /// Where a candidate fits in device memory, answered by llama.cpp's own
 /// memory fitter without starting a server.
 ///
@@ -74,8 +88,15 @@ pub const DEFAULT_BEAM_WIDTH: usize = 3;
 /// (`NCpuMoe` / `NGpuLayers`), which is what it decides.
 pub trait FitOracle {
     /// The fitted placement for `overrides`, or `None` when the fitter could
-    /// not answer.
+    /// not answer or found none.
     fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement>;
+
+    /// The shortfall when the fitter ran and found no placement at all for
+    /// this memory shape: not even the dense weights, the context and the
+    /// compute buffer fit. `None` when it placed the model or did not answer.
+    fn no_placement(&mut self, _overrides: &Overrides) -> Option<NoFit> {
+        None
+    }
 
     /// Why llama.cpp cannot create this configuration at all, when the fitter
     /// ran and said so (for example a quantized V cache without flash
@@ -376,6 +397,11 @@ fn refit_for_shape(
     let fit = oracle.placement(overrides)?;
     let current = |key: &str| overrides.get(key).and_then(serde_json::Value::as_i64);
     if space.is_moe {
+        // The fitter may keep fewer layers on the device; the expert-block
+        // count alone then says nothing about where the model went.
+        if !fit.is_expert_offload_only((space.block_count > 0).then(|| space.block_count + 1)) {
+            return None;
+        }
         let edge = (fit.n_cpu_moe() - slack).max(0);
         let asked = current("NCpuMoe").unwrap_or(0);
         let moves = if raise { asked != edge } else { asked < edge };
@@ -508,10 +534,58 @@ pub fn run_tuner_with(
         ("KvK", json!(params.baseline_kv.k.clone())),
         ("KvV", json!(params.baseline_kv.v.clone())),
     ]);
-    let fitted = oracle.as_deref_mut().and_then(|o| o.placement(&baseline));
+    let total_layers = (space.block_count > 0).then(|| space.block_count + 1);
+    // A MoE placement that keeps fewer layers on the device cannot be
+    // reproduced by `NCpuMoe`, so it is not a usable baseline.
+    let expert_offload_only =
+        |fit: &FitPlacement| !space.is_moe || fit.is_expert_offload_only(total_layers);
+    let mut fitted = oracle.as_deref_mut().and_then(|o| o.placement(&baseline));
+    let mut shortfall: Option<NoFit> = None;
+    if let Some(o) = oracle.as_deref_mut() {
+        if fitted.as_ref().is_some_and(|fit| !expert_offload_only(fit)) {
+            fitted = None;
+            shortfall = Some(NoFit { deficit_mib: None });
+        } else if fitted.is_none() {
+            shortfall = o.no_placement(&baseline);
+        }
+        if let Some(short) = shortfall {
+            events(format!(
+                "oracle: nothing fits at this shape{}; trying smaller batches and --no-op-offload",
+                short.short()
+            ));
+            let mut tried: Vec<String> = Vec::new();
+            for shape in shape_rescue_candidates(space) {
+                let candidate = join_overrides(&baseline, &shape);
+                let signature = candidate_signature(&shape);
+                match o.placement(&candidate).filter(expert_offload_only) {
+                    Some(fit) => {
+                        events(format!("oracle: {signature} has a placement"));
+                        baseline = candidate;
+                        fitted = Some(fit);
+                        break;
+                    }
+                    None => tried.push(signature),
+                }
+            }
+            if fitted.is_none() {
+                if o.rejection(&baseline).is_some() {
+                    events(format!(
+                        "stopped: no launch shape fits in device memory{}; tried {} smaller shapes (batch sizes down to the smallest, with and without --no-op-offload); use a smaller context, KV type or quant",
+                        short.short(),
+                        tried.len()
+                    ));
+                    return None;
+                }
+                events(
+                    "oracle: no smaller shape has a placement, but the shortfall is within the free-memory margin; searching the placement by trial"
+                        .to_string(),
+                );
+            }
+        }
+    }
     if let Some(fit) = &fitted {
         events(oracle_note(fit, space.is_moe));
-    } else if oracle.is_some() {
+    } else if oracle.is_some() && shortfall.is_none() {
         events(
             "oracle: llama-fit-params gave no answer; searching the placement by trial".to_string(),
         );
@@ -905,6 +979,7 @@ pub fn run_tuner_with(
                 events(format!(
                     "oracle miss: {key}={edge} did not start; backing off one step at a time"
                 ));
+                let mut recovered = false;
                 for step in 1..=ORACLE_RECOVERY_STEPS {
                     let value = edge - toward_gpu * step;
                     if value < lower || value > upper {
@@ -920,8 +995,29 @@ pub fn run_tuner_with(
                         events,
                     )) {
                         slack.set(-step);
+                        recovered = true;
                         break;
                     }
+                }
+                if !recovered {
+                    // A few single steps rarely close a real gap: end with the
+                    // placement that keeps the most off the device, so the run
+                    // gets a measurement to search from.
+                    let safest = if toward_gpu < 0 { upper } else { lower };
+                    events(format!(
+                        "oracle: backing off did not start; trying the safest placement {key}={safest}"
+                    ));
+                    let safest_shape =
+                        join_overrides(&baseline, &overrides_of(&[(key, json!(safest))]));
+                    // Only a starting measurement: the later phases search from it.
+                    measure(
+                        &safest_shape,
+                        "vram-fit",
+                        &mut trials,
+                        &mut history,
+                        &mut seen,
+                        events,
+                    );
                 }
             }
         }
@@ -2771,6 +2867,238 @@ mod tests {
             .count();
         assert_eq!(vram_fit, 2, "no ladder: two probes past the edge");
         assert!(oracle.calls >= 1);
+    }
+
+    /// An oracle for a card the baseline shape does not fit at all: only a
+    /// small batch with host operations kept off the GPU has a placement.
+    struct ShapeOracle {
+        inner: ScriptedOracle,
+        placement_for_partial_layers: bool,
+        margin_covers_the_gap: bool,
+        asked: Vec<String>,
+    }
+
+    impl ShapeOracle {
+        fn new() -> Self {
+            Self {
+                inner: ScriptedOracle {
+                    moe_edge_q8: 30,
+                    offset: 0,
+                    dense_layers: None,
+                    calls: 0,
+                },
+                placement_for_partial_layers: false,
+                margin_covers_the_gap: false,
+                asked: Vec::new(),
+            }
+        }
+
+        fn fits(overrides: &Overrides) -> bool {
+            let small = overrides
+                .get("UbatchSize")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|ub| ub <= 128);
+            small && overrides.get("NoOpOffload") == Some(&json!(true))
+        }
+    }
+
+    impl FitOracle for ShapeOracle {
+        fn placement(&mut self, overrides: &Overrides) -> Option<FitPlacement> {
+            self.asked.push(candidate_signature(overrides));
+            if self.placement_for_partial_layers && !Self::fits(overrides) {
+                // The fitter's other kind of answer: seven layers on the card.
+                return Some(FitPlacement {
+                    context: Some(262_144),
+                    gpu_layers: 7,
+                    cpu_expert_blocks: vec![43, 44, 45],
+                    tensor_overrides: None,
+                    devices: Vec::new(),
+                });
+            }
+            Self::fits(overrides)
+                .then(|| self.inner.placement(overrides))
+                .flatten()
+        }
+
+        fn no_placement(&mut self, overrides: &Overrides) -> Option<NoFit> {
+            (!Self::fits(overrides) && !self.placement_for_partial_layers).then_some(NoFit {
+                deficit_mib: Some(29819),
+            })
+        }
+
+        fn rejection(&mut self, overrides: &Overrides) -> Option<String> {
+            (!Self::fits(overrides) && !self.margin_covers_the_gap)
+                .then(|| "no placement fits: 28795 MiB more device memory than is free".to_string())
+        }
+    }
+
+    #[test]
+    fn a_shape_with_no_placement_is_rescued_by_a_smaller_batch_without_offload() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        let mut oracle = ShapeOracle::new();
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        )
+        .expect("a shape was found");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("nothing fits at this shape (29819 MiB short)")),
+            "{lines:#?}"
+        );
+        // 256 and 128 without offload do not fit, 128 with it does; the
+        // earlier, larger shapes never became trials.
+        assert!(lines.iter().any(
+            |l| l.contains("oracle: UbatchSize=128;BatchSize=128;NoOpOffload=true has a placement")
+        ));
+        assert!(!lines
+            .iter()
+            .any(|l| l.starts_with("oracle: fits with") && l.contains("UbatchSize=256")));
+        let first = &runner.measured.first().expect("a baseline trial").1;
+        assert_eq!(first.get("NoOpOffload"), Some(&json!(true)));
+        assert_eq!(first.get("UbatchSize"), Some(&json!(128)));
+        // The baseline starts; the one failure is the probe past the fitted edge.
+        assert!(
+            ooms(&runner.measured)
+                .iter()
+                .all(|oom| oom.starts_with("vram-fit:")),
+            "{:?}",
+            ooms(&runner.measured)
+        );
+        assert!(outcome.winner.overrides.contains_key("NCpuMoe"));
+    }
+
+    #[test]
+    fn a_shape_nothing_rescues_stops_before_any_trial_and_names_the_shortfall() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        // Every shape lacks a placement: nothing here sets the offload flag.
+        struct Never;
+        impl FitOracle for Never {
+            fn placement(&mut self, _: &Overrides) -> Option<FitPlacement> {
+                None
+            }
+            fn no_placement(&mut self, _: &Overrides) -> Option<NoFit> {
+                Some(NoFit {
+                    deficit_mib: Some(29819),
+                })
+            }
+            fn rejection(&mut self, _: &Overrides) -> Option<String> {
+                Some("no placement fits".to_string())
+            }
+        }
+        let mut lines = Vec::new();
+        let outcome = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut Never),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        );
+        assert!(outcome.is_none());
+        assert!(runner.measured.is_empty(), "no server trial is wasted");
+        assert!(lines
+            .iter()
+            .any(|l| l
+                .starts_with("stopped: no launch shape fits in device memory (29819 MiB short)")));
+        assert!(!lines.iter().any(|l| l.contains("oracle: fits with")));
+    }
+
+    #[test]
+    fn a_shortfall_inside_the_margin_is_tried_by_trial_instead_of_stopping() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        let mut oracle = ShapeOracle::new();
+        oracle.margin_covers_the_gap = true;
+        // No shape has a placement: only the small, offload-free one does.
+        struct NearMiss;
+        impl FitOracle for NearMiss {
+            fn placement(&mut self, _: &Overrides) -> Option<FitPlacement> {
+                None
+            }
+            fn no_placement(&mut self, _: &Overrides) -> Option<NoFit> {
+                Some(NoFit {
+                    deficit_mib: Some(900),
+                })
+            }
+        }
+        let mut lines = Vec::new();
+        let _ = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut NearMiss),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l
+                    .contains("within the free-memory margin; searching the placement by trial"))
+        );
+        assert!(!runner.measured.is_empty(), "the search went on by trial");
+    }
+
+    #[test]
+    fn a_placement_that_keeps_fewer_layers_is_not_used_as_an_expert_count() {
+        let mut runner = VramRunner {
+            moe_edge_q8: 30,
+            dense_max: 999,
+            measured: Vec::new(),
+        };
+        let mut oracle = ShapeOracle::new();
+        oracle.placement_for_partial_layers = true;
+        let mut lines = Vec::new();
+        let _ = run_tuner_with(
+            &mut runner,
+            &space(),
+            &seeds(),
+            &ctx(),
+            &params(),
+            TunerAids {
+                oracle: Some(&mut oracle),
+                screen: None,
+            },
+            &mut |line| lines.push(line),
+        );
+        // The seven-layer answer would have started the run at NCpuMoe=3.
+        assert!(
+            !lines.iter().any(|l| l == "oracle: fits with NCpuMoe=3"),
+            "{lines:#?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("nothing fits at this shape")));
     }
 
     #[test]

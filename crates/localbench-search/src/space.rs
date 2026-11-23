@@ -224,6 +224,9 @@ const PHASE_FLAGS: &[(&str, &[&str])] = &[
         &["-ctk", "--cache-type-k", "-ctv", "--cache-type-v"],
     ),
     ("spec-ngram", &["--spec-type"]),
+    // Not a measured phase: the shape-rescue step that decides whether host
+    // operations are offloaded. A pin keeps that step from varying it.
+    ("no-op-offload", &["--no-op-offload", "--op-offload"]),
 ];
 
 /// A search phase the model's catalog `ExtraArgs` pin, with the flag that
@@ -232,6 +235,53 @@ const PHASE_FLAGS: &[(&str, &[&str])] = &[
 pub struct PinnedPhase {
     pub phase: &'static str,
     pub flag: String,
+}
+
+/// Batch sizes the shape rescue tries, largest first: a bigger batch processes
+/// a prompt faster, so the first size that fits is the one kept.
+const RESCUE_BATCH_SIZES: [i64; 4] = [256, 128, 64, 32];
+
+/// Memory shapes to try, in order of preference, when the baseline shape has
+/// no placement at all: smaller `UbatchSize`/`BatchSize` shrink the compute
+/// buffer, and `NoOpOffload` stops host (expert) tensors from being staged
+/// through the GPU, which with a long context is the larger cost. For each
+/// batch size the shape that still offloads is tried before the one that does
+/// not. Axes the catalog pins are not varied. Pure.
+#[must_use]
+pub fn shape_rescue_candidates(space: &SearchSpace) -> Vec<Overrides> {
+    let batching_pinned = space.skip_phases.iter().any(|phase| phase == "batching");
+    let offload_pinned = space
+        .skip_phases
+        .iter()
+        .any(|phase| phase == "no-op-offload");
+    let batches: Vec<Option<i64>> = if batching_pinned {
+        vec![None]
+    } else {
+        RESCUE_BATCH_SIZES.iter().map(|size| Some(*size)).collect()
+    };
+    let offloads: &[bool] = if offload_pinned {
+        &[false]
+    } else {
+        &[false, true]
+    };
+    let mut out = Vec::new();
+    for batch in batches {
+        for no_op_offload in offloads {
+            let mut shape = Overrides::new();
+            if let Some(size) = batch {
+                shape.insert("UbatchSize".to_string(), size.into());
+                shape.insert("BatchSize".to_string(), size.into());
+            }
+            if *no_op_offload {
+                shape.insert("NoOpOffload".to_string(), true.into());
+            }
+            // Neither axis varied is the baseline shape itself.
+            if !shape.is_empty() {
+                out.push(shape);
+            }
+        }
+    }
+    out
 }
 
 /// The phases a catalog `ExtraArgs` list pins. Those arguments land after
@@ -640,6 +690,63 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    fn rescue_space(skip: &[&str]) -> SearchSpace {
+        resolve_search_space(
+            &ModelAxes {
+                n_cpu_moe: None,
+                config_n_cpu_moe: None,
+                n_gpu_layers: None,
+                moe_expert_layers: Some(48),
+                spec_type: None,
+                spec_draft_n_max: None,
+                skip_phases: skip.iter().map(|s| (*s).to_string()).collect(),
+            },
+            8,
+            48,
+        )
+    }
+
+    #[test]
+    fn the_shape_rescue_tries_the_largest_batch_that_still_offloads_first() {
+        let shapes: Vec<String> = shape_rescue_candidates(&rescue_space(&[]))
+            .iter()
+            .map(crate::overrides::candidate_signature)
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                "UbatchSize=256;BatchSize=256",
+                "UbatchSize=256;BatchSize=256;NoOpOffload=true",
+                "UbatchSize=128;BatchSize=128",
+                "UbatchSize=128;BatchSize=128;NoOpOffload=true",
+                "UbatchSize=64;BatchSize=64",
+                "UbatchSize=64;BatchSize=64;NoOpOffload=true",
+                "UbatchSize=32;BatchSize=32",
+                "UbatchSize=32;BatchSize=32;NoOpOffload=true",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shape_rescue_never_varies_an_axis_the_catalog_pins() {
+        let no_batching: Vec<String> = shape_rescue_candidates(&rescue_space(&["batching"]))
+            .iter()
+            .map(crate::overrides::candidate_signature)
+            .collect();
+        assert_eq!(no_batching, ["NoOpOffload=true"]);
+        let no_offload = shape_rescue_candidates(&rescue_space(&["no-op-offload"]));
+        assert_eq!(no_offload.len(), 4);
+        assert!(no_offload.iter().all(|s| !s.contains_key("NoOpOffload")));
+        assert!(shape_rescue_candidates(&rescue_space(&["batching", "no-op-offload"])).is_empty());
+    }
+
+    #[test]
+    fn a_no_op_offload_pin_in_extra_args_is_recognised() {
+        let pinned = phases_pinned_by_extra_args(&args(&["--no-op-offload", "-ub", "64"]));
+        let phases: Vec<&str> = pinned.iter().map(|pin| pin.phase).collect();
+        assert_eq!(phases, ["batching", "no-op-offload"]);
     }
 
     #[test]

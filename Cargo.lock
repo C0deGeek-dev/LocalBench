@@ -859,8 +859,8 @@ dependencies = [
 
 [[package]]
 name = "localbox-launcher"
-version = "5.0.0"
-source = "git+https://github.com/C0deGeek-dev/LocalBox.git?rev=c13464c0f465e84258904c2acec1dfec823b28de#c13464c0f465e84258904c2acec1dfec823b28de"
+version = "6.0.0"
+source = "git+https://github.com/C0deGeek-dev/LocalBox.git?rev=93b513ce7bb8252028c88d664fb687742931db64#93b513ce7bb8252028c88d664fb687742931db64"
 dependencies = [
  "localx-llama-core",
  "localx-llama-runtime",
@@ -875,7 +875,7 @@ dependencies = [
 [[package]]
 name = "localx-eval-core"
 version = "0.1.0"
-source = "git+https://github.com/C0deGeek-dev/localx-llama.git?rev=04965684163f927bc3d150a40a2b8f7627163877#04965684163f927bc3d150a40a2b8f7627163877"
+source = "git+https://github.com/C0deGeek-dev/localx-llama.git?rev=bc4914b3253707fc9c8c10b22acc8c5858f9f1a0#bc4914b3253707fc9c8c10b22acc8c5858f9f1a0"
 dependencies = [
  "regex",
  "serde",
@@ -888,7 +888,7 @@ dependencies = [
 [[package]]
 name = "localx-llama-core"
 version = "0.1.0"
-source = "git+https://github.com/C0deGeek-dev/localx-llama.git?rev=04965684163f927bc3d150a40a2b8f7627163877#04965684163f927bc3d150a40a2b8f7627163877"
+source = "git+https://github.com/C0deGeek-dev/localx-llama.git?rev=bc4914b3253707fc9c8c10b22acc8c5858f9f1a0#bc4914b3253707fc9c8c10b22acc8c5858f9f1a0"
 dependencies = [
  "regex",
  "serde",
@@ -899,7 +899,7 @@ dependencies = [
 [[package]]
 name = "localx-llama-runtime"
 version = "0.1.0"
-source = "git+https://github.com/C0deGeek-dev/localx-llama.git?rev=04965684163f927bc3d150a40a2b8f7627163877#04965684163f927bc3d150a40a2b8f7627163877"
+source = "git+https://github.com/C0deGeek-dev/localx-llama.git?rev=bc4914b3253707fc9c8c10b22acc8c5858f9f1a0#bc4914b3253707fc9c8c10b22acc8c5858f9f1a0"
 dependencies = [
  "axum",
  "bytes",
