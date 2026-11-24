@@ -4,6 +4,14 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **A tune of a model that keeps its reasoning on now yields a measurement.** The
+  trial reads the `reasoning_content` field the server returns apart from the
+  visible text. For a model with `ThinkingPolicy = "keep"`, a reply with no
+  visible text but sound reasoning counts, because its timings are real, and the
+  trial carries a note that it was reasoning only. An empty or degenerate reply
+  still fails, and a model that strips its reasoning still has to answer
+  visibly. LocalHub#302.
+
 - **A 256k tune of a large MoE model no longer ends on four OOM trials.** The
   memory-fit oracle no longer reports "fits" when `llama-fit-params` found no
   placement (`-ngl 0`); it reports the shortfall and tries smaller memory

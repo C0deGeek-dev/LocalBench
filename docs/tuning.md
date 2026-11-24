@@ -173,7 +173,12 @@ Placement flags (`-ngl`, `--n-cpu-moe`, `-ot`) and `-fit` / `-fitt` /
    including the MoE offload sweep below, which pins the KV pair while it moves
    the expert lever. If every allowed pair fails the same way, the run stops
    and says so; that is a model or engine problem, not a KV type one. A content
-   failure is never treated as, or reported as, memory pressure.
+   failure is never treated as, or reported as, memory pressure. A model
+   configured with `ThinkingPolicy = "keep"` may spend a reply on reasoning:
+   the server returns it in `reasoning_content`, and a reply with no visible
+   text but sound reasoning counts as a usable measurement (its timings are
+   real) and is noted as reasoning only. A reply empty or degenerate in both
+   fields still fails.
 3. **vram-fit** — fit the model into VRAM on the lever its architecture
    actually has, read from the GGUF header (expert count and layer count).
    - *MoE models* sweep `--n-cpu-moe`: the baseline value, the smart-seed

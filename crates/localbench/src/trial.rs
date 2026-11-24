@@ -289,6 +289,10 @@ struct ChatContentPart {
 struct ChatResponseMessage {
     #[serde(default)]
     content: Option<ChatContent>,
+    /// The model's reasoning, which llama.cpp returns here instead of in
+    /// `content` when the server runs with `--reasoning-format deepseek`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +323,9 @@ pub struct ChatMeasurement {
     pub pp_tps: f64,
     pub tg_tps: f64,
     pub content: String,
+    /// The reasoning the server returned separately from `content`; empty when
+    /// it returned none.
+    pub reasoning: String,
 }
 
 fn failure(
@@ -356,8 +363,12 @@ pub fn parse_chat_measurement(body: &str) -> Result<ChatMeasurement, TrialFailur
             "missing choices[0]",
         )
     })?;
-    let content = choice
-        .message
+    let message = choice.message;
+    let reasoning = message
+        .as_ref()
+        .and_then(|message| message.reasoning_content.clone())
+        .unwrap_or_default();
+    let content = message
         .and_then(|message| message.content)
         .ok_or_else(|| {
             failure(
@@ -407,7 +418,50 @@ pub fn parse_chat_measurement(body: &str) -> Result<ChatMeasurement, TrialFailur
         pp_tps,
         tg_tps,
         content,
+        reasoning,
     })
+}
+
+/// Recorded on a trial whose replies had no visible text, so it is never read as
+/// a visible answer.
+const REASONING_ONLY_NOTE: &str =
+    "reply was reasoning only (ThinkingPolicy keep): no visible text, the speeds are real";
+
+/// How a reply passed the content gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyKind {
+    /// The reply carried visible text.
+    Visible,
+    /// The reply had no visible text but the model's separate reasoning was
+    /// sound, for a model configured to keep its reasoning on.
+    ReasoningOnly,
+}
+
+/// The content gate for one measurement.
+///
+/// A model that strips its reasoning must answer visibly. A model configured to
+/// keep it (`ThinkingPolicy = "keep"`) may spend a reply on reasoning, which the
+/// server returns apart from the visible text: the reply then counts when that
+/// reasoning is itself sound, because the speeds in its timings are real. An
+/// empty or degenerate reply fails either way.
+fn validate_measurement(
+    measurement: &ChatMeasurement,
+    keeps_reasoning: bool,
+) -> Result<ReplyKind, TrialFailure> {
+    match validate_measurement_content(&measurement.content) {
+        Ok(()) => Ok(ReplyKind::Visible),
+        Err(failure)
+            if keeps_reasoning
+                && matches!(
+                    failure.reason,
+                    TrialFailureReason::EmptyContent | TrialFailureReason::ThinkingOnly
+                )
+                && validate_measurement_content(&measurement.reasoning).is_ok() =>
+        {
+            Ok(ReplyKind::ReasoningOnly)
+        }
+        Err(failure) => Err(failure),
+    }
 }
 
 fn validate_measurement_content(content: &str) -> Result<(), TrialFailure> {
@@ -1059,24 +1113,28 @@ impl LiveRunner<'_> {
         let (mut trial, telemetry) = collect_host_telemetry(|| {
             let mut pp = Vec::new();
             let mut tg = Vec::new();
+            let mut reasoning_only = false;
+            let keeps_reasoning = self.target.def.thinking_policy.as_deref() == Some("keep");
             for _ in 0..self.target.runs.max(1) {
                 match self.measure_once(port) {
                     Ok(measurement) => {
-                        if let Err(content_failure) =
-                            validate_measurement_content(&measurement.content)
-                        {
-                            let _ = child.kill();
-                            let status = child.wait().ok().and_then(|status| status.code());
-                            return Trial {
-                                startup_ok: true,
-                                oom: false,
-                                measurement_usable: false,
-                                failure: Some(content_failure),
-                                process_status: status,
-                                diagnostic_excerpt: sanitize_excerpt(&self.log_tail(log)),
-                                observed_configuration,
-                                ..Trial::default()
-                            };
+                        match validate_measurement(&measurement, keeps_reasoning) {
+                            Ok(ReplyKind::ReasoningOnly) => reasoning_only = true,
+                            Ok(ReplyKind::Visible) => {}
+                            Err(content_failure) => {
+                                let _ = child.kill();
+                                let status = child.wait().ok().and_then(|status| status.code());
+                                return Trial {
+                                    startup_ok: true,
+                                    oom: false,
+                                    measurement_usable: false,
+                                    failure: Some(content_failure),
+                                    process_status: status,
+                                    diagnostic_excerpt: sanitize_excerpt(&self.log_tail(log)),
+                                    observed_configuration,
+                                    ..Trial::default()
+                                };
+                            }
                         }
                         pp.push(measurement.pp_tps);
                         tg.push(measurement.tg_tps);
@@ -1114,6 +1172,11 @@ impl LiveRunner<'_> {
                 process_status: status,
                 diagnostic_excerpt: sanitize_excerpt(&self.log_tail(log)),
                 observed_configuration,
+                advisory_observations: if reasoning_only {
+                    vec![REASONING_ONLY_NOTE.to_string()]
+                } else {
+                    Vec::new()
+                },
                 ..Trial::default()
             }
         });
@@ -2167,6 +2230,56 @@ mod tests {
             startup_timeout_secs,
             "test-run",
         )
+    }
+
+    fn measurement(content: &str, reasoning: &str) -> ChatMeasurement {
+        ChatMeasurement {
+            pp_tps: 50.0,
+            tg_tps: 12.0,
+            content: content.to_string(),
+            reasoning: reasoning.to_string(),
+        }
+    }
+
+    const SOUND_REASONING: &str = "The user wants a short summary of how mixture of experts models work, so I should explain that a router picks a small set of experts for each token and that only those experts run.";
+
+    #[test]
+    fn the_reasoning_field_of_a_reply_is_parsed_when_the_server_returns_it() {
+        let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking it through"}}],
+            "timings":{"prompt_per_second":50.0,"predicted_per_second":12.0}}"#;
+        let parsed = parse_chat_measurement(body).unwrap();
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.reasoning, "thinking it through");
+        let plain = r#"{"choices":[{"message":{"content":"answer"}}],
+            "timings":{"prompt_per_second":50.0,"predicted_per_second":12.0}}"#;
+        assert_eq!(parse_chat_measurement(plain).unwrap().reasoning, "");
+    }
+
+    #[test]
+    fn a_reasoning_only_reply_counts_only_for_a_model_that_keeps_its_reasoning() {
+        let reply = measurement("", SOUND_REASONING);
+        assert_eq!(
+            validate_measurement(&reply, true),
+            Ok(ReplyKind::ReasoningOnly)
+        );
+        let stripped = validate_measurement(&reply, false).unwrap_err();
+        assert_eq!(stripped.reason, TrialFailureReason::EmptyContent);
+    }
+
+    #[test]
+    fn a_visible_answer_passes_whatever_the_reasoning_policy() {
+        let visible = "A router sends each token to a few experts, so only a fraction of the weights run for any one token, which keeps decoding fast while the total capacity stays large.";
+        let reply = measurement(visible, "");
+        assert_eq!(validate_measurement(&reply, true), Ok(ReplyKind::Visible));
+        assert_eq!(validate_measurement(&reply, false), Ok(ReplyKind::Visible));
+    }
+
+    #[test]
+    fn a_reply_empty_or_degenerate_in_both_fields_fails_even_when_reasoning_is_kept() {
+        assert!(validate_measurement(&measurement("", ""), true).is_err());
+        let flood = "/".repeat(400);
+        assert!(validate_measurement(&measurement("", &flood), true).is_err());
+        assert!(validate_measurement(&measurement(&flood, SOUND_REASONING), true).is_err());
     }
 
     /// A process that writes an OOM signature to its (redirected) log, then exits.
