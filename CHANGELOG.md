@@ -4,6 +4,11 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- **The minimum Rust version is now 1.89**, matching the rest of the stack. The
+  patched `quinn-proto`/`quinn-udp` (unbuilt HTTP/3 graph) and `url` 2.5.9
+  replace every `cargo audit` exception, and the shared localx-llama crates and
+  the LocalBox launcher move to their 1.89 releases.
+
 - **A tune of a model that keeps its reasoning on now yields a measurement.** The
   trial reads the `reasoning_content` field the server returns apart from the
   visible text. For a model with `ThinkingPolicy = "keep"`, a reply with no

@@ -116,10 +116,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-audit,cargo-machete
-      # rust-toolchain.toml pins MSRV 1.82, whose cargo cannot parse a
-      # transitive dependency's edition-2024 manifest metadata; `+stable`
-      # runs the check with the toolchain installed above instead of the
-      # pinned override.
+      # The supply-chain tools run on the latest stable toolchain installed
+      # above (`+stable`); the pinned MSRV from rust-toolchain.toml is what
+      # the rust jobs build and test with.
       - run: cargo +stable deny --locked check
       - run: cargo audit
       - run: cargo machete

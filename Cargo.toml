@@ -13,7 +13,7 @@
 #                          export/profile store, machine-output discipline
 #
 # Shared primitives come from the public localx-llama crate tier via a
-# rev-pinned git dependency. MSRV 1.82 / edition 2021, exact-pinned deps.
+# rev-pinned git dependency. MSRV 1.89 / edition 2021, exact-pinned deps.
 
 [workspace]
 resolver = "2"
@@ -29,7 +29,7 @@ edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["David <David@c0degeek.dev>", "Bram (C0deGeek.dev)"]
 repository = "https://github.com/C0deGeek-dev/LocalBench"
-rust-version = "1.82"
+rust-version = "1.89"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -55,8 +55,8 @@ sysinfo = "=0.32.1"
 # Launcher trait — the diamond-dep breakage), so advance the -core/-runtime
 # revs only together with a localbox-launcher re-pin whose own -core pin
 # matches.
-localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "bc4914b3253707fc9c8c10b22acc8c5858f9f1a0" }
-localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "bc4914b3253707fc9c8c10b22acc8c5858f9f1a0" }
-localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "bc4914b3253707fc9c8c10b22acc8c5858f9f1a0" }
-localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "93b513ce7bb8252028c88d664fb687742931db64" }
+localx-eval-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "45e993fb9b1f086567bb2a9a7ce3eea61f1137aa" }
+localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "45e993fb9b1f086567bb2a9a7ce3eea61f1137aa" }
+localx-llama-runtime = { git = "https://github.com/C0deGeek-dev/localx-llama.git", rev = "45e993fb9b1f086567bb2a9a7ce3eea61f1137aa" }
+localbox-launcher = { git = "https://github.com/C0deGeek-dev/LocalBox.git", rev = "5d32ac500a2262ec05f99c7d3e33cc2f3e5a1bf1" }
 
