@@ -4,6 +4,10 @@ Past-tense record of shipped changes, newest first.
 
 ## Unreleased
 
+- Windows: the binaries link the C runtime statically, so they start on a
+  Windows without the Visual C++ Redistributable (a fresh install has none);
+  the release checks every shipped binary for runtime imports.
+
 - **The minimum Rust version is now 1.89**, matching the rest of the stack. The
   patched `quinn-proto`/`quinn-udp` (unbuilt HTTP/3 graph) and `url` 2.5.9
   replace every `cargo audit` exception, and the shared localx-llama crates and
